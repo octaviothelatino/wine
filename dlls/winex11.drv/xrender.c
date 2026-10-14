@@ -38,6 +38,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "x11drv.h"
+#include "xcomposite.h"
 #include "winternl.h"
 #include "wine/debug.h"
 
@@ -49,6 +50,9 @@ WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
 #include <X11/Xlib.h>
 #include <X11/extensions/Xrender.h>
+#ifdef HAVE_LIBXSHAPE
+#include <X11/extensions/shape.h>
+#endif
 
 #ifndef RepeatNone  /* added in 0.10 */
 #define RepeatNone    0
@@ -184,6 +188,7 @@ MAKE_FUNCPTR(XRenderFindVisualFormat)
 MAKE_FUNCPTR(XRenderFreeGlyphSet)
 MAKE_FUNCPTR(XRenderFreePicture)
 MAKE_FUNCPTR(XRenderSetPictureClipRectangles)
+MAKE_FUNCPTR(XRenderSetPictureClipRegion)
 #ifdef HAVE_XRENDERCREATELINEARGRADIENT
 MAKE_FUNCPTR(XRenderCreateLinearGradient)
 #endif
@@ -218,6 +223,192 @@ static pthread_mutex_t xrender_mutex = PTHREAD_MUTEX_INITIALIZER;
 static BOOL has_alpha( enum wxr_format format )
 {
     return (format == WXR_FORMAT_A8R8G8B8 || format == WXR_FORMAT_B8G8R8A8);
+}
+
+struct composited_child
+{
+    struct composited_child *next;
+    Window window;
+    XWindowAttributes attributes;
+};
+
+static int child_composition_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return 1;
+}
+
+static void release_composited_child( struct composited_child *child )
+{
+#ifdef SONAME_LIBXCOMPOSITE
+    X11DRV_expect_error( gdi_display, child_composition_error, NULL );
+    pXCompositeUnredirectWindow( gdi_display, child->window, CompositeRedirectManual );
+    XSync( gdi_display, False );
+    X11DRV_check_error();
+#endif
+    free( child );
+}
+
+void X11DRV_XRender_ReleaseChildren( void **state )
+{
+    struct composited_child *child = *state, *next;
+
+    while (child)
+    {
+        next = child->next;
+        release_composited_child( child );
+        child = next;
+    }
+    *state = NULL;
+}
+
+void X11DRV_XRender_PrepareChildren( Window parent, void **state )
+{
+#ifdef SONAME_LIBXCOMPOSITE
+    struct composited_child *child, **link;
+    Window root, ancestor, *children;
+    unsigned int count, i;
+
+    if (!usexcomposite || !pict_formats[WXR_FORMAT_A8R8G8B8]) return;
+    if (!XQueryTree( gdi_display, parent, &root, &ancestor, &children, &count )) return;
+
+    /* QueryTree returns bottom-to-top order. Keep that order for blending. */
+    link = (struct composited_child **)state;
+    for (i = 0; i < count; ++i)
+    {
+        XWindowAttributes attributes;
+        XRenderPictFormat *format;
+        BOOL valid;
+        int error;
+
+        X11DRV_expect_error( gdi_display, child_composition_error, NULL );
+        valid = XGetWindowAttributes( gdi_display, children[i], &attributes );
+        XSync( gdi_display, False );
+        error = X11DRV_check_error();
+        if (!valid || error || attributes.map_state != IsViewable || attributes.depth != 32) continue;
+        format = pXRenderFindVisualFormat( gdi_display, attributes.visual );
+        if (!format || !format->direct.alphaMask) continue;
+        for (child = *state; child && child->window != children[i]; child = child->next) {}
+        if (!child)
+        {
+            if (!(child = calloc( 1, sizeof(*child) ))) continue;
+            X11DRV_expect_error( gdi_display, child_composition_error, NULL );
+            pXCompositeRedirectWindow( gdi_display, children[i], CompositeRedirectManual );
+            XSync( gdi_display, False );
+            if (X11DRV_check_error())
+            {
+                free( child );
+                continue;
+            }
+            child->window = children[i];
+            child->next = *link;
+            *link = child;
+        }
+        else if (*link != child)
+        {
+            struct composited_child **previous = (struct composited_child **)state;
+
+            while (*previous != child) previous = &(*previous)->next;
+            *previous = child->next;
+            child->next = *link;
+            *link = child;
+        }
+        child->attributes = attributes;
+        link = &child->next;
+    }
+    XFree( children );
+    while ((child = *link))
+    {
+        *link = child->next;
+        release_composited_child( child );
+    }
+#endif
+}
+
+void X11DRV_XRender_CompositeChildren( Window parent, Drawable drawable, void *state, HRGN clip )
+{
+    struct composited_child *child;
+    XWindowAttributes attributes;
+    XRenderPictureAttributes pa = {.subwindow_mode = ClipByChildren};
+    XRenderPictFormat *format;
+    RGNDATA *data = NULL;
+    Region visible = NULL;
+    Picture destination;
+
+    if (!state || !XGetWindowAttributes( gdi_display, parent, &attributes )) return;
+    if (!(format = pXRenderFindVisualFormat( gdi_display, attributes.visual ))) return;
+    if (clip && !(data = X11DRV_GetRegionData( clip, 0 ))) return;
+    if (data)
+    {
+        unsigned int i;
+
+        visible = XCreateRegion();
+        for (i = 0; i < data->rdh.nCount; ++i)
+            XUnionRectWithRegion( (XRectangle *)data->Buffer + i, visible, visible );
+    }
+    destination = pXRenderCreatePicture( gdi_display, drawable, format, CPSubwindowMode, &pa );
+    X11DRV_expect_error( gdi_display, child_composition_error, NULL );
+    for (child = state; child; child = child->next)
+    {
+        Region shape = XCreateRegion();
+        XRectangle bounds = {child->attributes.x, child->attributes.y,
+                             child->attributes.width, child->attributes.height};
+        Picture source = pXRenderCreatePicture( gdi_display, child->window,
+                           pXRenderFindVisualFormat( gdi_display, child->attributes.visual ), 0, NULL );
+
+#ifdef HAVE_LIBXSHAPE
+        int count = 0, ordering, i;
+        XRectangle *rectangles = XShapeGetRectangles( gdi_display, child->window, ShapeBounding,
+                                                      &count, &ordering );
+
+        if (rectangles)
+        {
+            for (i = 0; i < count; ++i)
+                XUnionRectWithRegion( rectangles + i, shape, shape );
+            XOffsetRegion( shape, child->attributes.x, child->attributes.y );
+            XFree( rectangles );
+        }
+        else if (count) XUnionRectWithRegion( &bounds, shape, shape );
+#else
+        XUnionRectWithRegion( &bounds, shape, shape );
+#endif
+        if (visible) XIntersectRegion( shape, visible, shape );
+        pXRenderSetPictureClipRegion( gdi_display, destination, shape );
+
+        pXRenderComposite( gdi_display, PictOpOver, source, None, destination, 0, 0, 0, 0,
+                          child->attributes.x, child->attributes.y,
+                          child->attributes.width, child->attributes.height );
+        pXRenderFreePicture( gdi_display, source );
+        XDestroyRegion( shape );
+    }
+    pXRenderFreePicture( gdi_display, destination );
+    XSync( gdi_display, False );
+    X11DRV_check_error();
+    if (visible) XDestroyRegion( visible );
+    free( data );
+}
+
+BOOL X11DRV_XRender_CopyAlpha( Pixmap source, Window destination, const RECT *rect,
+                              const RECT *dirty, HRGN clip )
+{
+    XRenderPictFormat *format = pict_formats[WXR_FORMAT_A8R8G8B8];
+    XRenderPictureAttributes attributes = {.subwindow_mode = ClipByChildren};
+    Picture src, dst;
+    RGNDATA *data = NULL;
+
+    if (!format) return FALSE;
+    if (clip && !(data = X11DRV_GetRegionData( clip, 0 ))) return FALSE;
+    src = pXRenderCreatePicture( gdi_display, source, format, 0, NULL );
+    dst = pXRenderCreatePicture( gdi_display, destination, format, CPSubwindowMode, &attributes );
+    if (data)
+        pXRenderSetPictureClipRectangles( gdi_display, dst, 0, 0,
+                                         (XRectangle *)data->Buffer, data->rdh.nCount );
+    pXRenderComposite( gdi_display, PictOpSrc, src, None, dst, dirty->left, dirty->top, 0, 0,
+                      rect->left + dirty->left, rect->top + dirty->top,
+                      dirty->right - dirty->left, dirty->bottom - dirty->top );
+    pXRenderFreePicture( gdi_display, dst );
+    pXRenderFreePicture( gdi_display, src );
+    free( data );
+    return TRUE;
 }
 
 static enum wxr_format get_format_without_alpha( enum wxr_format format )
@@ -340,6 +531,7 @@ const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
     LOAD_FUNCPTR(XRenderFreeGlyphSet);
     LOAD_FUNCPTR(XRenderFreePicture);
     LOAD_FUNCPTR(XRenderSetPictureClipRectangles);
+    LOAD_FUNCPTR(XRenderSetPictureClipRegion);
     LOAD_FUNCPTR(XRenderQueryExtension);
 #ifdef HAVE_XRENDERCREATELINEARGRADIENT
     LOAD_OPTIONAL_FUNCPTR(XRenderCreateLinearGradient);
@@ -2261,6 +2453,16 @@ static const struct gdi_dc_funcs xrender_funcs =
 };
 
 #else /* SONAME_LIBXRENDER */
+
+void X11DRV_XRender_PrepareChildren( Window parent, void **state ) {}
+void X11DRV_XRender_CompositeChildren( Window parent, Drawable destination, void *state, HRGN clip ) {}
+void X11DRV_XRender_ReleaseChildren( void **state ) {}
+
+BOOL X11DRV_XRender_CopyAlpha( Pixmap source, Window destination, const RECT *rect,
+                              const RECT *dirty, HRGN clip )
+{
+    return FALSE;
+}
 
 const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
 {

@@ -26,6 +26,19 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
+static void visual_clear_frame(struct composition_visual *visual)
+{
+    if (visual->cached_surface)
+        IDXGISurface1_Release(visual->cached_surface);
+    if (visual->readback_texture)
+        ID3D11Texture2D_Release(visual->readback_texture);
+    free(visual->cached_pixels);
+    visual->cached_surface = NULL;
+    visual->readback_texture = NULL;
+    visual->cached_pixels = NULL;
+    visual->cached_width = visual->cached_height = 0;
+}
+
 static HRESULT STDMETHODCALLTYPE visual_QueryInterface(IDCompositionVisual2 *iface, REFIID iid,
         void **out)
 {
@@ -91,6 +104,7 @@ static ULONG STDMETHODCALLTYPE visual_Release(IDCompositionVisual2 *iface)
     visual->interop = NULL;
     visual->device_context = NULL;
     visual->content = NULL;
+    visual_clear_frame(visual);
     LeaveCriticalSection(&device->cs);
 
     LIST_FOR_EACH_ENTRY_SAFE(child, next, &children, struct composition_visual, entry)
@@ -279,6 +293,7 @@ static HRESULT STDMETHODCALLTYPE visual_SetContent(IDCompositionVisual2 *iface, 
     old_interop = visual->interop;
     old_device_context = visual->device_context;
     old_content = visual->content;
+    visual_clear_frame(visual);
     visual->interop = NULL;
     visual->device_context = NULL;
     visual->content = NULL;

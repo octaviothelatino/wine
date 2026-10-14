@@ -18,6 +18,7 @@
  */
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define COBJMACROS
 #include "windef.h"
@@ -119,104 +120,89 @@ static HWND get_composition_destination(HWND hwnd, POINT *offset)
     return hwnd;
 }
 
-static void trace_swapchain_buffer(struct composition_visual *visual,
-        IDXGISwapChain1 *swapchain, ID2D1Bitmap1 *target_bitmap, UINT buffer_idx,
-        D2D1_SIZE_U size)
+
+static BOOL composite_frame(struct composition_target *target, struct composition_visual *visual,
+        HWND destination, POINT offset, float visual_offset_x, float visual_offset_y,
+        IDXGISurface1 *surface, BOOL immutable)
 {
-    ID2D1Bitmap *probe_bitmap = NULL;
-    IDXGISurface1 *probe_surface = NULL;
-    ID2D1Image *old_target = NULL;
-    HDC probe_dc;
-    HRESULT hr;
-    POINT points[4] = {{0, 0}, {(LONG)size.width / 2, (LONG)size.height / 2},
-            {(LONG)size.width / 4, (LONG)size.height / 4},
-            {(LONG)size.width - 1, (LONG)size.height - 1}};
-    unsigned int i;
-
-    hr = IDXGISwapChain1_GetBuffer(swapchain, buffer_idx, &IID_IDXGISurface1,
-            (void **)&probe_surface);
-    TRACE("swapchain %p probe GetBuffer index %u hr %#lx surface %p.\n",
-            swapchain, buffer_idx, hr, probe_surface);
-    if (FAILED(hr))
-        goto done;
-
-    hr = ID2D1DeviceContext_CreateSharedBitmap(visual->device_context, &IID_IDXGISurface,
-            probe_surface, NULL, &probe_bitmap);
-    TRACE("swapchain %p probe buffer %u CreateSharedBitmap hr %#lx bitmap %p.\n",
-            swapchain, buffer_idx, hr, probe_bitmap);
-    if (FAILED(hr))
-        goto done;
-
-    hr = ID2D1Bitmap1_CopyFromBitmap(target_bitmap, NULL, probe_bitmap, NULL);
-    TRACE("swapchain %p probe buffer %u CopyFromBitmap hr %#lx.\n",
-            swapchain, buffer_idx, hr);
-    if (FAILED(hr))
-        goto done;
-
-    ID2D1DeviceContext_GetTarget(visual->device_context, &old_target);
-    ID2D1DeviceContext_SetTarget(visual->device_context, (ID2D1Image *)target_bitmap);
-    hr = ID2D1GdiInteropRenderTarget_GetDC(visual->interop, D2D1_DC_INITIALIZE_MODE_COPY,
-            &probe_dc);
-    TRACE("swapchain %p probe buffer %u GetDC hr %#lx dc %p.\n",
-            swapchain, buffer_idx, hr, probe_dc);
-    if (SUCCEEDED(hr))
-    {
-        for (i = 0; i < ARRAY_SIZE(points); ++i)
-            TRACE("source probe swapchain %p buffer %u point %ld,%ld GetPixel %#lx.\n",
-                    swapchain, buffer_idx, points[i].x, points[i].y,
-                    (unsigned long)GetPixel(probe_dc, points[i].x, points[i].y));
-        ID2D1GdiInteropRenderTarget_ReleaseDC(visual->interop, NULL);
-    }
-
-    ID2D1DeviceContext_SetTarget(visual->device_context, old_target);
-    if (old_target)
-        ID2D1Image_Release(old_target);
-
-done:
-    if (probe_bitmap)
-        ID2D1Bitmap_Release(probe_bitmap);
-    if (probe_surface)
-        IDXGISurface1_Release(probe_surface);
-}
-
-static BOOL composite_frame(struct composition_target *target, HWND destination, POINT offset,
-        float visual_offset_x, float visual_offset_y,
-        IDXGISurface1 *surface)
-{
-    ID3D11Texture2D *texture = NULL, *staging = NULL;
+    ID3D11Texture2D *texture = NULL;
     ID3D11Device *device = NULL;
     ID3D11DeviceContext *context = NULL;
-    D3D11_TEXTURE2D_DESC desc;
+    D3D11_TEXTURE2D_DESC desc, readback_desc;
     D3D11_MAPPED_SUBRESOURCE mapped;
     BOOL mapped_valid = FALSE, copied = FALSE;
+    BYTE *pixels;
+    UINT y;
     HRESULT hr;
+
+    /* The DXGI handoff owns an immutable snapshot. Reuse its CPU image until
+     * Present replaces that snapshot, including when another visual changes. */
+    if (immutable && surface == visual->cached_surface && visual->cached_pixels)
+        goto composite;
 
     hr = IDXGISurface1_QueryInterface(surface, &IID_ID3D11Texture2D, (void **)&texture);
     if (FAILED(hr)) goto done;
     ID3D11Texture2D_GetDesc(texture, &desc);
-    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) goto done;
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || !desc.Width || !desc.Height
+            || desc.Width > ~(SIZE_T)0 / 4 / desc.Height)
+        goto done;
     ID3D11Texture2D_GetDevice(texture, &device);
     ID3D11Device_GetImmediateContext(device, &context);
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    desc.MiscFlags = 0;
-    hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &staging);
-    if (FAILED(hr)) goto done;
-    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)staging, (ID3D11Resource *)texture);
-    hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (visual->readback_texture)
+    {
+        ID3D11Texture2D_GetDesc(visual->readback_texture, &readback_desc);
+        if (desc.Width != readback_desc.Width || desc.Height != readback_desc.Height
+                || desc.Format != readback_desc.Format)
+        {
+            ID3D11Texture2D_Release(visual->readback_texture);
+            visual->readback_texture = NULL;
+        }
+    }
+    if (!visual->readback_texture)
+    {
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+        hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &visual->readback_texture);
+        if (FAILED(hr)) goto done;
+    }
+    if (!visual->cached_pixels || visual->cached_width != desc.Width || visual->cached_height != desc.Height)
+    {
+        pixels = realloc(visual->cached_pixels, (SIZE_T)desc.Width * desc.Height * 4);
+        if (!pixels) goto done;
+        visual->cached_pixels = pixels;
+    }
+    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)visual->readback_texture,
+            (ID3D11Resource *)texture);
+    hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)visual->readback_texture,
+            0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) goto done;
     mapped_valid = TRUE;
+    for (y = 0; y < desc.Height; ++y)
+        memcpy(visual->cached_pixels + (SIZE_T)y * desc.Width * 4,
+                (const BYTE *)mapped.pData + (SIZE_T)y * mapped.RowPitch, (SIZE_T)desc.Width * 4);
+    ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)visual->readback_texture, 0);
+    mapped_valid = FALSE;
+    visual->cached_width = desc.Width;
+    visual->cached_height = desc.Height;
+    if (visual->cached_surface)
+        IDXGISurface1_Release(visual->cached_surface);
+    visual->cached_surface = NULL;
+    if (immutable)
+    {
+        IDXGISurface1_AddRef(surface);
+        visual->cached_surface = surface;
+    }
+
+composite:
     offset.x += (LONG)visual_offset_x;
     offset.y += (LONG)visual_offset_y;
-    copied = target_composite_surface(target, destination, &offset, desc.Width, desc.Height,
-            mapped.pData, mapped.RowPitch);
-    ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
-    mapped_valid = FALSE;
+    copied = target_composite_surface(target, destination, &offset, visual->cached_width,
+            visual->cached_height, visual->cached_pixels, visual->cached_width * 4);
 done:
     if (mapped_valid)
-        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
-    if (staging) ID3D11Texture2D_Release(staging);
+        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)visual->readback_texture, 0);
     if (context) ID3D11DeviceContext_Release(context);
     if (device) ID3D11Device_Release(device);
     if (texture) ID3D11Texture2D_Release(texture);
@@ -305,30 +291,14 @@ static void do_composite(struct composition_target *target, struct composition_v
     size.width = swapchain_desc.Width;
     size.height = swapchain_desc.Height;
 
-    if (FAILED(hr = ID2D1DeviceContext_CreateBitmap(visual->device_context, size, NULL, 0,
-            &bitmap_desc, &target_bitmap)))
-    {
-        ERR("Failed to create a bitmap, hr %#lx.\n", hr);
-        goto done;
-    }
-
-    if (swapchain_desc.Width == 1258 && swapchain_desc.Height >= 700
-            && swapchain_desc.BufferCount > 1 && target->source_pixel_trace_count < 16)
-    {
-        unsigned int i;
-
-        for (i = 0; i < swapchain_desc.BufferCount; ++i)
-            trace_swapchain_buffer(visual, swapchain, target_bitmap, i, size);
-    }
-
     {
         UINT surface_size = sizeof(surface);
 
         hr = IDXGISwapChain1_GetPrivateData(swapchain, &composition_frame_key, &surface_size, &surface);
         if (SUCCEEDED(hr) && surface)
         {
-            composite_frame(target, destination, offset, visual_offset_x,
-                    visual_offset_y, surface);
+            composite_frame(target, visual, destination, offset, visual_offset_x,
+                    visual_offset_y, surface, TRUE);
             goto done;
         }
     }
@@ -338,8 +308,8 @@ static void do_composite(struct composition_target *target, struct composition_v
                 (void **)&surface);
         if (SUCCEEDED(hr) && surface)
         {
-            composite_frame(target, destination, offset, visual_offset_x,
-                    visual_offset_y, surface);
+            composite_frame(target, visual, destination, offset, visual_offset_x,
+                    visual_offset_y, surface, FALSE);
             goto done;
         }
     }
@@ -348,6 +318,13 @@ static void do_composite(struct composition_target *target, struct composition_v
     if (FAILED(hr))
     {
         ERR("Failed to get the swapchain front buffer, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (FAILED(hr = ID2D1DeviceContext_CreateBitmap(visual->device_context, size, NULL, 0,
+            &bitmap_desc, &target_bitmap)))
+    {
+        ERR("Failed to create a bitmap, hr %#lx.\n", hr);
         goto done;
     }
 
@@ -384,7 +361,7 @@ static void do_composite(struct composition_target *target, struct composition_v
 
     offset.x += (LONG)visual_offset_x;
     offset.y += (LONG)visual_offset_y;
-    if (size.width == 1258 && size.height >= 700 && target->source_pixel_trace_count < 16)
+    if (TRACE_ON(dcomp) && size.width == 1258 && size.height >= 700 && target->source_pixel_trace_count < 16)
     {
         POINT points[4] = {{0, 0}, {(LONG)size.width / 2, (LONG)size.height / 2},
                 {(LONG)size.width / 4, (LONG)size.height / 4},
@@ -458,6 +435,30 @@ static unsigned int composite_visual_tree(struct composition_target *target,
     return count;
 }
 
+static BOOL visual_tree_changed(struct composition_visual *visual)
+{
+    struct composition_visual *child;
+    IDXGISwapChain1 *swapchain;
+    IDXGISurface1 *surface = NULL;
+    UINT size = sizeof(surface);
+    BOOL changed;
+    HRESULT hr;
+
+    if (visual->content)
+    {
+        if (FAILED(IUnknown_QueryInterface(visual->content, &IID_IDXGISwapChain1, (void **)&swapchain)))
+            return TRUE;
+        hr = IDXGISwapChain1_GetPrivateData(swapchain, &composition_frame_key, &size, &surface);
+        changed = FAILED(hr) || !surface || surface != visual->cached_surface;
+        if (surface) IDXGISurface1_Release(surface);
+        IDXGISwapChain1_Release(swapchain);
+        if (changed) return TRUE;
+    }
+    LIST_FOR_EACH_ENTRY(child, &visual->children, struct composition_visual, entry)
+        if (visual_tree_changed(child)) return TRUE;
+    return FALSE;
+}
+
 static DWORD WINAPI composite_thread_proc(void *iface)
 {
     struct composition_device *device = impl_from_IDCompositionDevice(iface);
@@ -479,7 +480,7 @@ static DWORD WINAPI composite_thread_proc(void *iface)
         count = 0;
         LIST_FOR_EACH_ENTRY(target, &device->targets, struct composition_target, entry)
         {
-            HWND destination;
+            HWND destination, root;
             POINT offset;
 
             if (!target->root)
@@ -489,9 +490,31 @@ static DWORD WINAPI composite_thread_proc(void *iface)
             if (!visual)
                 continue;
             destination = get_composition_destination(target->hwnd, &offset);
+            root = GetAncestor(destination, GA_ROOT);
+            MapWindowPoints(destination, root, &offset, 1);
+            if (target->frame_geometry_valid && target->surface_visible && target->surface_published_valid
+                    && IsWindowVisible(destination) && IsWindowVisible(target->surface)
+                    && target->frame_root == root
+                    && target->frame_origin.x == offset.x && target->frame_origin.y == offset.y
+                    && target->commit_serial == device->commit_serial && !visual_tree_changed(visual))
+            {
+                ++count;
+                continue;
+            }
             target_begin_surface_frame(target, destination);
+            if (!target->surface_frame_active)
+            {
+                ++count;
+                continue;
+            }
             count += composite_visual_tree(target, visual, 0.0f, 0.0f);
-            target_present_surface_frame(target, destination);
+            if (target_present_surface_frame(target, destination))
+            {
+                target->frame_geometry_valid = TRUE;
+                target->frame_root = root;
+                target->frame_origin = offset;
+                target->commit_serial = device->commit_serial;
+            }
         }
 
         if (!count)
@@ -516,6 +539,7 @@ static HRESULT STDMETHODCALLTYPE device_Commit(IDCompositionDevice *iface)
     static unsigned int trace_count;
 
     EnterCriticalSection(&device->cs);
+    ++device->commit_serial;
     if (!device->thread || device->thread_exited)
     {
         if (device->thread)

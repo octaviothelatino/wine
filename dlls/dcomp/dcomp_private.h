@@ -20,6 +20,7 @@
 
 #include "dcomp.h"
 #include "d2d1_1.h"
+#include "d3d11.h"
 #include "wingdi.h"
 #include "wine/list.h"
 
@@ -31,6 +32,7 @@ struct composition_device
     struct list targets;
     HANDLE thread;
     BOOL thread_exited;
+    ULONG commit_serial;
     int version;
     LONG ref;
 };
@@ -66,6 +68,10 @@ struct composition_target
     BOOL surface_frame_active;
     BOOL surface_frame_has_content;
     BOOL surface_published_valid;
+    BOOL frame_geometry_valid;
+    HWND frame_root;
+    POINT frame_origin;
+    ULONG commit_serial;
     unsigned int source_pixel_trace_count;
     unsigned int surface_pixel_trace_count;
     struct list entry;
@@ -79,6 +85,11 @@ struct composition_visual
     ID2D1GdiInteropRenderTarget *interop;
     ID2D1DeviceContext *device_context;
     IUnknown *content;
+    IDXGISurface1 *cached_surface;
+    ID3D11Texture2D *readback_texture;
+    BYTE *cached_pixels;
+    UINT cached_width;
+    UINT cached_height;
     float offset_x;
     float offset_y;
     D2D_MATRIX_3X2_F transform;
@@ -123,7 +134,7 @@ BOOL target_update_surface(struct composition_target *target, HWND parent, const
 void target_begin_surface_frame(struct composition_target *target, HWND parent);
 BOOL target_composite_surface(struct composition_target *target, HWND parent, const POINT *position,
         UINT width, UINT height, const void *source_bits, UINT source_pitch);
-void target_present_surface_frame(struct composition_target *target, HWND parent);
+BOOL target_present_surface_frame(struct composition_target *target, HWND parent);
 void target_destroy_surface(struct composition_target *target);
 
 #endif /* __WINE_DCOMP_PRIVATE_H */

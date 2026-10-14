@@ -55,6 +55,7 @@ static void target_release_surface_bitmap(struct composition_target *target)
     target->surface_frame_active = FALSE;
     target->surface_frame_has_content = FALSE;
     target->surface_published_valid = FALSE;
+    target->frame_geometry_valid = FALSE;
 }
 
 void target_destroy_surface(struct composition_target *target)
@@ -117,7 +118,7 @@ static BOOL target_create_surface(struct composition_target *target, HWND parent
      * WebView child beneath it continues to receive clicks and hover events. */
     target->surface = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT
             | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"static", NULL,
-            WS_CHILD | WS_VISIBLE, 0, 0, width, height, parent, NULL, GetModuleHandleW(NULL), NULL);
+            WS_CHILD, 0, 0, width, height, parent, NULL, GetModuleHandleW(NULL), NULL);
     if (!target->surface)
     {
         WARN("Failed to create composition surface, error %lu.\n", GetLastError());
@@ -221,7 +222,7 @@ BOOL target_update_surface(struct composition_target *target, HWND parent, const
         return FALSE;
     }
 
-    if (width == 1258 && height >= 650 && target->surface_bits
+    if (TRACE_ON(dcomp) && width == 1258 && height >= 650 && target->surface_bits
             && target->surface_pixel_trace_count < 16)
     {
         POINT points[4] = {{0, 0}, {(LONG)width / 2, (LONG)height / 2},
@@ -493,7 +494,7 @@ BOOL target_composite_surface(struct composition_target *target, HWND parent, co
     return TRUE;
 }
 
-void target_present_surface_frame(struct composition_target *target, HWND parent)
+BOOL target_present_surface_frame(struct composition_target *target, HWND parent)
 {
     BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     POINT source = {0, 0};
@@ -504,10 +505,10 @@ void target_present_surface_frame(struct composition_target *target, HWND parent
     SIZE_T frame_size = (SIZE_T)target->surface_width * target->surface_height * 4;
 
     if (!target->surface_frame_active)
-        return;
+        return FALSE;
     target->surface_frame_active = FALSE;
     if (!parent || !IsWindow(parent))
-        return;
+        return FALSE;
     if (!IsWindowVisible(parent))
     {
         if (target->surface)
@@ -516,10 +517,10 @@ void target_present_surface_frame(struct composition_target *target, HWND parent
             target->surface_position_valid = FALSE;
             target->surface_visible = FALSE;
         }
-        return;
+        return FALSE;
     }
     if (!target->surface_frame_has_content || !target->surface || !target->surface_bits)
-        return;
+        return FALSE;
 
     geometry_changed = !target->surface_position_valid || !target->surface_visible
             || target->surface_x != position.x || target->surface_y != position.y
@@ -533,13 +534,13 @@ void target_present_surface_frame(struct composition_target *target, HWND parent
             || target->surface_published_size < frame_size
             || memcmp(target->surface_published_bits, target->surface_bits, frame_size);
     if (!frame_changed && !geometry_changed)
-        return;
+        return TRUE;
 
     if (!UpdateLayeredWindow(target->surface, NULL, NULL, &size, target->surface_dc,
             &source, 0, &blend, ULW_ALPHA))
     {
         WARN("Failed to publish composition frame, error %lu.\n", GetLastError());
-        return;
+        return FALSE;
     }
 
     if (!target->surface_published_bits || target->surface_published_size < frame_size)
@@ -554,7 +555,7 @@ void target_present_surface_frame(struct composition_target *target, HWND parent
             target->surface_published_size = frame_size;
         }
     }
-    if (target->surface_published_bits)
+    if (target->surface_published_bits && target->surface_published_size >= frame_size)
     {
         memcpy(target->surface_published_bits, target->surface_bits, frame_size);
         target->surface_published_width = target->surface_width;
@@ -572,13 +573,14 @@ void target_present_surface_frame(struct composition_target *target, HWND parent
                 SWP_NOACTIVATE | SWP_SHOWWINDOW))
         {
             WARN("Failed to position composition frame, error %lu.\n", GetLastError());
-            return;
+            return FALSE;
         }
         target->surface_x = position.x;
         target->surface_y = position.y;
         target->surface_position_valid = TRUE;
         target->surface_visible = TRUE;
     }
+    return TRUE;
 }
 
 static const WCHAR *wine_window_topmost_composed = L"wine_window_topmost_composed";

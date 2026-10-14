@@ -3160,7 +3160,7 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     struct x11drv_win_data *data;
 
     escape.code = X11DRV_SET_DRAWABLE;
-    escape.mode = IncludeInferiors;
+    escape.mode = ClipByChildren;
     escape.drawable = 0;
 
     escape.dc_rect.left         = win_rect->left - top_rect->left;

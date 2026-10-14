@@ -265,6 +265,9 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
+    X11DRV_XRender_ReleaseChildren( &surface->composited_children );
+    if (surface->composition_gc) XFreeGC( gdi_display, surface->composition_gc );
+    if (surface->composition_pixmap) XFreePixmap( gdi_display, surface->composition_pixmap );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
@@ -331,6 +334,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
 
     if (!offscreen)
     {
+        X11DRV_XRender_ReleaseChildren( &surface->composited_children );
 #ifdef SONAME_LIBXCOMPOSITE
         if (usexcomposite) pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
 #endif
@@ -384,6 +388,7 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
     RECT rect_dst, rect_src = client->virtual_rect, rect;
     Drawable window;
+    Drawable destination;
     HRGN region;
 
     if (!hdc) return;
@@ -401,14 +406,45 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
         rect_dst = client->monitor_rect;
     }
 
-    if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
+    X11DRV_XRender_PrepareChildren( window, &surface->composited_children );
+    destination = window;
+    if (surface->composited_children)
+    {
+        XWindowAttributes attributes;
+
+        if (XGetWindowAttributes( gdi_display, window, &attributes ))
+        {
+            if (!surface->composition_pixmap || surface->composition_width != attributes.width
+                    || surface->composition_height != attributes.height)
+            {
+                if (surface->composition_gc) XFreeGC( gdi_display, surface->composition_gc );
+                if (surface->composition_pixmap) XFreePixmap( gdi_display, surface->composition_pixmap );
+                surface->composition_width = attributes.width;
+                surface->composition_height = attributes.height;
+                surface->composition_pixmap = XCreatePixmap( gdi_display, window,
+                        attributes.width, attributes.height, attributes.depth );
+                surface->composition_gc = XCreateGC( gdi_display, surface->composition_pixmap, 0, NULL );
+                XSetGraphicsExposures( gdi_display, surface->composition_gc, False );
+                XSetSubwindowMode( gdi_display, surface->composition_gc, ClipByChildren );
+            }
+            destination = surface->composition_pixmap;
+            XCopyArea( gdi_display, window, destination, surface->composition_gc, 0, 0,
+                       attributes.width, attributes.height, 0, 0 );
+        }
+    }
+
+    if (get_dc_drawable( surface->hdc_dst, &rect ) != destination || !EqualRect( &rect, &rect_dst ))
         /* Independently drawn children, including layered composition surfaces,
          * must survive presentation of their parent's offscreen client. */
-        set_dc_drawable( surface->hdc_dst, window, &rect_dst, ClipByChildren );
+        set_dc_drawable( surface->hdc_dst, destination, &rect_dst, ClipByChildren );
     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
 
     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                      surface->hdc_src, 0, 0, rect_src.right - rect_src.left, rect_src.bottom - rect_src.top, SRCCOPY, 0 );
+    X11DRV_XRender_CompositeChildren( window, destination, surface->composited_children, region );
+    if (destination != window)
+        XCopyArea( gdi_display, destination, window, surface->composition_gc, 0, 0,
+                   surface->composition_width, surface->composition_height, 0, 0 );
     XFlush( gdi_display );
 
     if (region) NtGdiDeleteObjectApp( region );

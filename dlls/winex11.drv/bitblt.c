@@ -1589,6 +1589,8 @@ struct x11drv_window_surface
     GC                    gc;
     struct x11drv_image  *image;
     BOOL                  byteswap;
+    Pixmap                alpha_pixmap;
+    GC                    alpha_gc;
 };
 
 static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
@@ -1798,9 +1800,8 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
     XImage *ximage = surface->image->ximage;
     const unsigned char *src = color_bits;
     unsigned char *dst = (unsigned char *)ximage->data;
-    BOOL debug_flush = window_surface->hwnd && ximage->depth == 32 &&
-                       color_info->bmiHeader.biWidth >= 1000 && abs( color_info->bmiHeader.biHeight ) >= 600 &&
-                       debug_flush_count < 160;
+    BOOL debug_flush = TRACE_ON(bitblt) && window_surface->hwnd && ximage->depth == 32 &&
+                       color_info->bmiHeader.biWidth > 256 && debug_flush_count < 12;
     unsigned int debug_index = debug_flush ? debug_flush_count++ : 0;
 
     if (alpha_bits == -1)
@@ -1900,11 +1901,34 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
 #endif /* HAVE_LIBXSHAPE */
     }
 
+    if (alpha_mask && ximage->depth == 32)
+    {
+        RECT origin = {0};
+
+        /* Core window image writes can discard alpha. Upload to a pixmap,
+         * then use Render's explicitly alpha-aware source copy. */
+        if (!surface->alpha_pixmap)
+        {
+            surface->alpha_pixmap = XCreatePixmap( gdi_display, surface->window,
+                                                   ximage->width, ximage->height, 32 );
+            surface->alpha_gc = XCreateGC( gdi_display, surface->alpha_pixmap, 0, NULL );
+        }
+        if (!put_shm_image( ximage, &surface->image->shminfo, surface->alpha_pixmap,
+                            surface->alpha_gc, &origin, dirty ))
+            XPutImage( gdi_display, surface->alpha_pixmap, surface->alpha_gc, ximage,
+                       dirty->left, dirty->top, dirty->left, dirty->top,
+                       dirty->right - dirty->left, dirty->bottom - dirty->top );
+        if (X11DRV_XRender_CopyAlpha( surface->alpha_pixmap, surface->window, rect, dirty,
+                                     window_surface->clip_region ))
+            goto flushed;
+    }
+
     if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
                    dirty->right - dirty->left, dirty->bottom - dirty->top );
 
+flushed:
     XFlush( gdi_display );
 
     if (debug_flush)
@@ -1939,6 +1963,8 @@ static void x11drv_surface_destroy( struct window_surface *window_surface )
 
     TRACE( "freeing %p\n", surface );
     if (surface->gc) XFreeGC( gdi_display, surface->gc );
+    if (surface->alpha_gc) XFreeGC( gdi_display, surface->alpha_gc );
+    if (surface->alpha_pixmap) XFreePixmap( gdi_display, surface->alpha_pixmap );
     if (surface->image) x11drv_image_destroy( surface->image );
 }
 
@@ -2016,7 +2042,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
         surface->byteswap = byteswap;
         surface->window = window;
         surface->gc = XCreateGC( gdi_display, window, 0, NULL );
-        XSetSubwindowMode( gdi_display, surface->gc, IncludeInferiors );
+        XSetSubwindowMode( gdi_display, surface->gc, ClipByChildren );
     }
 
     return window_surface;
@@ -2065,7 +2091,7 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
         goto done; /* draw directly to the window */
     }
 
-    if (layered && debug_surface_count < 80)
+    if (TRACE_ON(bitblt) && layered && debug_surface_count < 80)
     {
         TRACE( "surface_create[%u] hwnd %p layered %u xwindow %lx embedded %u preserved %u "
                "use_alpha %u visual %#lx depth %d argb_visual %#lx argb_depth %d rect %s\n",
