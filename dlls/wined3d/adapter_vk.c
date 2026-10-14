@@ -18,6 +18,7 @@
 
 #include "wined3d_private.h"
 #include "wined3d_vk.h"
+#include "wine/d3dkmt.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
 
@@ -1363,6 +1364,92 @@ static HRESULT adapter_vk_create_texture(struct wined3d_device *device,
     return hr;
 }
 
+static HRESULT adapter_vk_create_shared_texture(struct wined3d_device *device, HANDLE shared_handle,
+        void *parent, const struct wined3d_parent_ops *parent_ops, struct wined3d_resource_desc *desc,
+        unsigned int *layer_count, unsigned int *level_count, struct wined3d_texture **texture)
+{
+    struct wined3d_texture_vk *texture_vk;
+    HRESULT hr;
+
+    TRACE("device %p, shared_handle %p, parent %p, parent_ops %p, desc %p, layer_count %p, "
+            "level_count %p, texture %p.\n", device, shared_handle, parent, parent_ops, desc,
+            layer_count, level_count, texture);
+
+    if (desc->resource_type != WINED3D_RTYPE_TEXTURE_2D || !*layer_count || !*level_count)
+        return E_INVALIDARG;
+
+    if (!(texture_vk = wined3d_texture_allocate_object_memory(sizeof(*texture_vk), *level_count, *layer_count)))
+        return E_OUTOFMEMORY;
+
+    if (FAILED(hr = wined3d_texture_vk_init(texture_vk, device, desc, *layer_count,
+            *level_count, WINED3D_TEXTURE_CREATE_SHARED, parent, parent_ops)))
+    {
+        WARN("Failed to initialise shared texture, hr %#lx.\n", hr);
+        free(texture_vk);
+        return hr;
+    }
+
+    texture_vk->shared_import = TRUE;
+    texture_vk->shared_handle = shared_handle;
+    texture_vk->shared_global = PtrToUlong(shared_handle);
+    *texture = &texture_vk->t;
+    return S_OK;
+}
+
+static BOOL adapter_vk_update_shared_desc(struct wined3d_resource *resource)
+{
+    const struct wined3d_shared_resource_desc *shared_desc;
+    struct d3dkmt_d3d11_desc d3d11_desc = {0};
+    D3DKMT_ESCAPE escape = {0};
+    struct wined3d_texture_vk *texture_vk;
+
+    texture_vk = wined3d_texture_vk(texture_from_resource(resource));
+    shared_desc = &texture_vk->t.shared_desc;
+    if (!texture_vk->t.shared_desc_valid)
+    {
+        WARN("No shared resource descriptor was provided.\n");
+        return FALSE;
+    }
+
+    d3d11_desc.dxgi.size = sizeof(d3d11_desc);
+    d3d11_desc.dxgi.version = 4;
+    d3d11_desc.dxgi.width = shared_desc->width;
+    d3d11_desc.dxgi.height = shared_desc->height;
+    d3d11_desc.dxgi.format = shared_desc->dxgi_format;
+    d3d11_desc.dxgi.keyed_mutex = !!(shared_desc->misc_flags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
+    d3d11_desc.dxgi.mutex_handle = shared_desc->mutex_handle;
+    d3d11_desc.dxgi.sync_handle = shared_desc->sync_handle;
+    d3d11_desc.dxgi.nt_shared = !!(shared_desc->misc_flags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+    d3d11_desc.dimension = D3D11_RESOURCE_DIMENSION_TEXTURE2D;
+    d3d11_desc.d3d11_2d.Width = shared_desc->width;
+    d3d11_desc.d3d11_2d.Height = shared_desc->height;
+    d3d11_desc.d3d11_2d.MipLevels = shared_desc->mip_levels;
+    d3d11_desc.d3d11_2d.ArraySize = shared_desc->array_size;
+    d3d11_desc.d3d11_2d.Format = shared_desc->dxgi_format;
+    d3d11_desc.d3d11_2d.SampleDesc.Count = shared_desc->sample_count;
+    d3d11_desc.d3d11_2d.SampleDesc.Quality = shared_desc->sample_quality;
+    d3d11_desc.d3d11_2d.Usage = shared_desc->usage;
+    d3d11_desc.d3d11_2d.BindFlags = shared_desc->bind_flags;
+    d3d11_desc.d3d11_2d.CPUAccessFlags = shared_desc->cpu_access_flags;
+    d3d11_desc.d3d11_2d.MiscFlags = shared_desc->misc_flags;
+
+    TRACE("Publishing shared resource %p: keyed_mutex %u, mutex_handle %#x, sync_handle %#x.\n",
+            resource, d3d11_desc.dxgi.keyed_mutex, d3d11_desc.dxgi.mutex_handle,
+            d3d11_desc.dxgi.sync_handle);
+
+    escape.Type = D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE;
+    escape.hContext = texture_vk->shared_global;
+    escape.pPrivateDriverData = &d3d11_desc;
+    escape.PrivateDriverDataSize = sizeof(d3d11_desc);
+    if (D3DKMTEscape(&escape))
+    {
+        WARN("Failed to publish shared resource descriptor.\n");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 static void adapter_vk_destroy_texture(struct wined3d_texture *texture)
 {
     struct wined3d_texture_vk *texture_vk = wined3d_texture_vk(texture);
@@ -1386,6 +1473,65 @@ static void adapter_vk_destroy_texture(struct wined3d_texture *texture)
 
     if (swapchain_count)
         wined3d_device_decref(device);
+}
+
+static HRESULT adapter_vk_get_shared_handle(struct wined3d_resource *resource, HANDLE *shared_handle)
+{
+    struct wined3d_texture_vk *texture_vk = wined3d_texture_vk(texture_from_resource(resource));
+    struct wined3d_device_vk *device_vk = wined3d_device_vk(resource->device);
+    struct wined3d_context_vk *context_vk;
+    struct wined3d_context *context;
+    VkMemoryGetWin32HandleInfoKHR get_handle_info;
+    HANDLE handle = NULL;
+    VkResult vr;
+
+    TRACE("resource %p, shared_handle %p.\n", resource, shared_handle);
+
+    if (resource->type != WINED3D_RTYPE_TEXTURE_2D || !texture_vk->shared)
+        return E_INVALIDARG;
+
+    if (texture_vk->shared_global)
+    {
+        *shared_handle = (HANDLE)(ULONG_PTR)texture_vk->shared_global;
+        return S_OK;
+    }
+
+    if (!device_vk->vk_info.vk_ops.vkGetMemoryWin32HandleKHR)
+    {
+        WARN("Vulkan Win32 KMT handle export is unavailable.\n");
+        return E_NOTIMPL;
+    }
+
+    if (!(context = context_acquire(resource->device, texture_from_resource(resource), 0)))
+        return E_FAIL;
+    context_vk = wined3d_context_vk(context);
+    if (!wined3d_texture_vk_prepare_texture(texture_vk, context_vk))
+    {
+        context_release(context);
+        return E_FAIL;
+    }
+    wined3d_context_vk_submit_command_buffer(context_vk, 0, NULL, NULL, 0, NULL);
+    context_release(context);
+
+    get_handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
+    get_handle_info.pNext = NULL;
+    get_handle_info.memory = texture_vk->image.vk_memory;
+    get_handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+    if ((vr = device_vk->vk_info.vk_ops.vkGetMemoryWin32HandleKHR(device_vk->vk_device,
+            &get_handle_info, &handle)) != VK_SUCCESS)
+    {
+        WARN("Failed to export shared image handle, vr %s.\n", wined3d_debug_vkresult(vr));
+        return E_FAIL;
+    }
+
+    if (!handle)
+        return E_FAIL;
+
+    texture_vk->shared_global = PtrToUlong(handle);
+    if (!adapter_vk_update_shared_desc(resource))
+        return E_FAIL;
+    *shared_handle = handle;
+    return S_OK;
 }
 
 static HRESULT adapter_vk_create_rendertarget_view(const struct wined3d_view_desc *desc,
@@ -1882,6 +2028,8 @@ static const struct wined3d_adapter_ops wined3d_adapter_vk_ops =
     .adapter_destroy_buffer = adapter_vk_destroy_buffer,
     .adapter_create_texture = adapter_vk_create_texture,
     .adapter_destroy_texture = adapter_vk_destroy_texture,
+    .adapter_create_shared_texture = adapter_vk_create_shared_texture,
+    .adapter_get_shared_handle = adapter_vk_get_shared_handle,
     .adapter_create_rendertarget_view = adapter_vk_create_rendertarget_view,
     .adapter_destroy_rendertarget_view = adapter_vk_destroy_rendertarget_view,
     .adapter_create_shader_resource_view = adapter_vk_create_shader_resource_view,
@@ -2419,6 +2567,7 @@ static bool wined3d_adapter_vk_init_device_extensions(struct wined3d_adapter_vk 
          * KHR_external_memory_fd for VA support, and we need to enable the
          * fd extension by enabling the win32 extension. */
         {VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,             ~0u},
+        {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,          ~0u},
         {VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,       ~0u},
         {VK_KHR_MAINTENANCE1_EXTENSION_NAME,                VK_API_VERSION_1_1, true},
         {VK_KHR_MAINTENANCE2_EXTENSION_NAME,                VK_API_VERSION_1_1},

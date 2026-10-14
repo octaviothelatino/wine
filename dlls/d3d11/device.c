@@ -4591,12 +4591,105 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateDeferredContext(ID3D11Device
     return S_OK;
 }
 
+static HRESULT d3d11_device_open_shared_resource(struct d3d_device *device, HANDLE resource,
+        REFIID iid, void **out)
+{
+    struct wined3d_resource_desc wined3d_desc = {0};
+    struct d3dkmt_d3d11_desc runtime_desc = {0};
+    D3DKMT_ESCAPE escape = {0};
+    struct wined3d_texture *wined3d_texture = NULL;
+    struct d3d_texture2d *texture = NULL;
+    D3D11_TEXTURE2D_DESC desc;
+    unsigned int layer_count, level_count;
+    NTSTATUS status;
+    HRESULT hr;
+
+    if (!resource || !iid || !out)
+        return E_INVALIDARG;
+    *out = NULL;
+
+    escape.Type = D3DKMT_ESCAPE_QUERY_RESOURCE_WINE;
+    escape.hContext = (D3DKMT_HANDLE)(ULONG_PTR)resource;
+    escape.pPrivateDriverData = &runtime_desc;
+    escape.PrivateDriverDataSize = sizeof(runtime_desc);
+    if ((status = D3DKMTEscape(&escape)))
+    {
+        WARN("Failed to query shared resource %#x, status %#lx.\n", escape.hContext, status);
+        return E_INVALIDARG;
+    }
+
+    if (runtime_desc.dxgi.size != sizeof(runtime_desc)
+            || runtime_desc.dxgi.version != 4
+            || runtime_desc.dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        WARN("Unsupported shared resource descriptor, size %#x, version %#x, dimension %#x.\n",
+                runtime_desc.dxgi.size, runtime_desc.dxgi.version, runtime_desc.dimension);
+        return E_INVALIDARG;
+    }
+
+    TRACE("Shared resource %#x: keyed_mutex %u, mutex_handle %#x, sync_handle %#x, nt_shared %u.\n",
+            resource, runtime_desc.dxgi.keyed_mutex, runtime_desc.dxgi.mutex_handle,
+            runtime_desc.dxgi.sync_handle, runtime_desc.dxgi.nt_shared);
+
+    desc = runtime_desc.d3d11_2d;
+    if (!desc.Width || !desc.Height || !desc.MipLevels || !desc.ArraySize || !desc.SampleDesc.Count)
+        return E_INVALIDARG;
+
+    wined3d_desc.resource_type = WINED3D_RTYPE_TEXTURE_2D;
+    wined3d_desc.format = wined3dformat_from_dxgi_format(desc.Format);
+    wined3d_desc.multisample_type = desc.SampleDesc.Count > 1 ? desc.SampleDesc.Count : WINED3D_MULTISAMPLE_NONE;
+    wined3d_desc.multisample_quality = desc.SampleDesc.Quality;
+    wined3d_desc.usage = wined3d_usage_from_d3d11(desc.Usage);
+    wined3d_desc.bind_flags = wined3d_bind_flags_from_d3d11(desc.BindFlags, desc.MiscFlags);
+    wined3d_desc.access = wined3d_access_from_d3d11(desc.Usage,
+            desc.Usage == D3D11_USAGE_DEFAULT ? 0 : desc.CPUAccessFlags);
+    wined3d_desc.width = desc.Width;
+    wined3d_desc.height = desc.Height;
+    wined3d_desc.depth = 1;
+
+    layer_count = desc.ArraySize;
+    level_count = desc.MipLevels;
+
+    wined3d_mutex_lock();
+    hr = wined3d_texture_create_shared(device->wined3d_device, resource, NULL,
+            &d3d_null_wined3d_parent_ops, &wined3d_desc, &layer_count, &level_count, &wined3d_texture);
+    if (SUCCEEDED(hr))
+    {
+        hr = d3d_texture2d_create(device, &desc, wined3d_texture, NULL, &texture);
+        if (SUCCEEDED(hr) && runtime_desc.dxgi.keyed_mutex && runtime_desc.dxgi.mutex_handle
+                && !runtime_desc.dxgi.nt_shared)
+        {
+            D3DKMT_OPENKEYEDMUTEX open = {0};
+
+            open.hSharedHandle = runtime_desc.dxgi.mutex_handle;
+            if (!(status = D3DKMTOpenKeyedMutex(&open)))
+                d3d_texture2d_set_shared_mutex(texture, open.hKeyedMutex, open.hSharedHandle);
+            else
+                WARN("Failed to open keyed mutex %#x, status %#lx.\n",
+                        open.hSharedHandle, status);
+        }
+        wined3d_texture_decref(wined3d_texture);
+    }
+    wined3d_mutex_unlock();
+    if (FAILED(hr))
+    {
+        WARN("Failed to import shared texture %#x, hr %#lx.\n", escape.hContext, hr);
+        return hr;
+    }
+
+    hr = ID3D11Texture2D_QueryInterface(&texture->ID3D11Texture2D_iface, iid, out);
+    ID3D11Texture2D_Release(&texture->ID3D11Texture2D_iface);
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedResource(ID3D11Device5 *iface, HANDLE resource, REFIID iid,
         void **out)
 {
-    FIXME("iface %p, resource %p, iid %s, out %p stub!\n", iface, resource, debugstr_guid(iid), out);
+    struct d3d_device *device = impl_from_ID3D11Device5(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, resource %p, iid %s, out %p.\n", iface, resource, debugstr_guid(iid), out);
+
+    return d3d11_device_open_shared_resource(device, resource, iid, out);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFormatSupport(ID3D11Device5 *iface, DXGI_FORMAT format,

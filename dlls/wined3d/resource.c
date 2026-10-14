@@ -307,6 +307,43 @@ void CDECL wined3d_resource_get_desc(const struct wined3d_resource *resource, st
     desc->size = resource->size;
 }
 
+struct wined3d_shared_handle_op
+{
+    struct wined3d_resource *resource;
+    HANDLE *shared_handle;
+    HRESULT hr;
+};
+
+static void wined3d_resource_get_shared_handle_cs(void *object)
+{
+    struct wined3d_shared_handle_op *op = object;
+    struct wined3d_resource *resource = op->resource;
+
+    op->hr = resource->device->adapter->adapter_ops->adapter_get_shared_handle(resource, op->shared_handle);
+}
+
+HRESULT CDECL wined3d_resource_get_shared_handle(struct wined3d_resource *resource, HANDLE *shared_handle)
+{
+    struct wined3d_shared_handle_op op;
+
+    TRACE("resource %p, shared_handle %p.\n", resource, shared_handle);
+
+    if (!resource || !shared_handle)
+        return E_INVALIDARG;
+    if (!resource->device->adapter->adapter_ops->adapter_get_shared_handle)
+        return E_NOTIMPL;
+
+    if (resource->device->cs->thread_id == GetCurrentThreadId())
+        return resource->device->adapter->adapter_ops->adapter_get_shared_handle(resource, shared_handle);
+
+    op.resource = resource;
+    op.shared_handle = shared_handle;
+    op.hr = E_FAIL;
+    wined3d_cs_init_object(resource->device->cs, wined3d_resource_get_shared_handle_cs, &op);
+    wined3d_cs_finish(resource->device->cs, WINED3D_CS_QUEUE_DEFAULT);
+    return op.hr;
+}
+
 HRESULT CDECL wined3d_resource_map(struct wined3d_resource *resource, unsigned int sub_resource_idx,
         struct wined3d_map_desc *map_desc, const struct wined3d_box *box, uint32_t flags)
 {

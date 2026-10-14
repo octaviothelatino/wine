@@ -402,7 +402,9 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     }
 
     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
-        set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
+        /* Independently drawn children, including layered composition surfaces,
+         * must survive presentation of their parent's offscreen client. */
+        set_dc_drawable( surface->hdc_dst, window, &rect_dst, ClipByChildren );
     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
 
     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,

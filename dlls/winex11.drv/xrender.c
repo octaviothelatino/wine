@@ -485,8 +485,10 @@ static Picture get_xrender_picture( struct xrender_physdev *dev, HRGN clip_rgn, 
     if (!dev->pict && dev->pict_format)
     {
         XRenderPictureAttributes pa;
+        XGCValues values;
 
-        pa.subwindow_mode = IncludeInferiors;
+        XGetGCValues( gdi_display, dev->x11dev->gc, GCSubwindowMode, &values );
+        pa.subwindow_mode = values.subwindow_mode;
         dev->pict = pXRenderCreatePicture( gdi_display, dev->x11dev->drawable,
                                            dev->pict_format, CPSubwindowMode, &pa );
         TRACE( "Allocing pict=%lx dc=%p drawable=%08lx\n",
@@ -524,8 +526,10 @@ static Picture get_xrender_picture_source( struct xrender_physdev *dev, BOOL rep
     if (!dev->pict_src && dev->pict_format)
     {
         XRenderPictureAttributes pa;
+        XGCValues values;
 
-        pa.subwindow_mode = IncludeInferiors;
+        XGetGCValues( gdi_display, dev->x11dev->gc, GCSubwindowMode, &values );
+        pa.subwindow_mode = values.subwindow_mode;
         pa.repeat = repeat ? RepeatNormal : RepeatNone;
         dev->pict_src = pXRenderCreatePicture( gdi_display, dev->x11dev->drawable,
                                                dev->pict_format, CPSubwindowMode|CPRepeat, &pa );

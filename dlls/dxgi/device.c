@@ -462,7 +462,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_swapchain_factory_create_swapchain(IWineDX
         return E_OUTOFMEMORY;
     }
 
-    if (FAILED(hr = d3d11_swapchain_init(object, device, &wined3d_desc, fullscreen_desc)))
+    if (FAILED(hr = d3d11_swapchain_init(object, device, &wined3d_desc, desc->AlphaMode,
+            fullscreen_desc)))
     {
         WARN("Failed to initialise swapchain, hr %#lx.\n", hr);
         free(object);

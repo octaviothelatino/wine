@@ -1406,6 +1406,8 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
 {
     const RECT *old_rect = &data->pending_state.rect;
     BOOL old_above = data->pending_state.above;
+    BOOL child = data->preserved_child || ((NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_CHILD)
+            && NtUserGetAncestor( data->hwnd, GA_PARENT ) != NtUserGetDesktopWindow());
     XWindowChanges changes;
     RECT *new_rect = &rect;
     UINT mask = 0;
@@ -1444,7 +1446,23 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
         new_rect->bottom = new_rect->top + old_rect->bottom - old_rect->top;
     }
 
-    if (old_rect->left != new_rect->left || old_rect->top != new_rect->top)
+    if (child)
+    {
+        /* A preserved whole window is now an X11 child of the top-level host.
+         * Its Win32 rectangle is already relative to the Win32 parent, so do
+         * not convert it to root coordinates as for a managed top-level. */
+        if (old_rect->left != new_rect->left || old_rect->top != new_rect->top)
+        {
+            changes.x = new_rect->left;
+            changes.y = new_rect->top;
+            mask |= CWX | CWY;
+        }
+        else
+        {
+            OffsetRect( new_rect, old_rect->left - new_rect->left, old_rect->top - new_rect->top );
+        }
+    }
+    else if (old_rect->left != new_rect->left || old_rect->top != new_rect->top)
     {
         POINT pt = virtual_screen_to_root( new_rect->left, new_rect->top );
         changes.x = pt.x;
@@ -1468,6 +1486,50 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     TRACE( "window %p/%lx, requesting config %s mask %#x above %u, serial %lu\n", data->hwnd, data->whole_window,
            wine_dbgstr_rect(new_rect), mask, above, data->configure_serial );
     XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen, mask, &changes );
+}
+
+static void sync_child_window_z_order( struct x11drv_win_data *data, HWND prev, BOOL above, BOOL bottom )
+{
+    XWindowChanges changes;
+    Window sibling = 0;
+    DWORD style;
+
+    style = NtUserGetWindowLongW( data->hwnd, GWL_STYLE );
+    TRACE( "window %p/%lx z-order input prev %p above %u bottom %u style %#lx preserved %u parent %lx.\n",
+            data->hwnd, data->whole_window, prev, above, bottom, (unsigned long)style,
+            data->preserved_child, data->parent ? data->parent->window : 0 );
+    if ((!data->preserved_child && !(style & WS_CHILD)) || !data->whole_window
+            || !data->parent || data->parent->window == root_window)
+        return;
+
+    if (bottom)
+    {
+        TRACE( "window %p/%lx, lowering below child siblings\n", data->hwnd, data->whole_window );
+        XLowerWindow( data->display, data->whole_window );
+        return;
+    }
+
+    while (prev)
+    {
+        if ((NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE)
+                && (sibling = X11DRV_get_whole_window( prev )))
+            break;
+        prev = NtUserGetWindowRelative( prev, GW_HWNDPREV );
+    }
+
+    if (sibling && sibling != data->whole_window)
+    {
+        changes.sibling = sibling;
+        changes.stack_mode = Below;
+        TRACE( "window %p/%lx, placing below sibling %lx\n", data->hwnd,
+               data->whole_window, sibling );
+        XConfigureWindow( data->display, data->whole_window, CWSibling | CWStackMode, &changes );
+    }
+    else if (above)
+    {
+        TRACE( "window %p/%lx, raising above child siblings\n", data->hwnd, data->whole_window );
+        XRaiseWindow( data->display, data->whole_window );
+    }
 }
 
 /***********************************************************************
@@ -1632,12 +1694,31 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     case MAKELONG(WithdrawnState, NormalState):
     case MAKELONG(IconicState, NormalState):
         if (data->embedded) set_xembed_flags( data, XEMBED_MAPPED );
-        else XMapWindow( data->display, data->whole_window );
+        else if (data->preserved_child)
+        {
+            TRACE( "window %p/%lx mapping preserved child with XMapRaised, managed %u visible %u state %#x -> %#x\n",
+                   data->hwnd, data->whole_window, data->managed, !!(NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_VISIBLE ),
+                   old_state, new_state );
+            XMapRaised( data->display, data->whole_window );
+        }
+        else
+        {
+            TRACE( "window %p/%lx mapping window with XMapWindow, managed %u visible %u state %#x -> %#x\n",
+                   data->hwnd, data->whole_window, data->managed, !!(NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_VISIBLE ),
+                   old_state, new_state );
+            XMapWindow( data->display, data->whole_window );
+        }
         break;
     case MAKELONG(NormalState, WithdrawnState):
     case MAKELONG(IconicState, WithdrawnState):
         if (data->embedded) set_xembed_flags( data, 0 );
-        else if (!data->managed) XUnmapWindow( data->display, data->whole_window );
+        else if (!data->managed)
+        {
+            TRACE( "window %p/%lx unmapping unmanaged window with XUnmapWindow, preserved %u visible %u state %#x -> %#x\n",
+                   data->hwnd, data->whole_window, data->preserved_child,
+                   !!(NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_VISIBLE ), old_state, new_state );
+            XUnmapWindow( data->display, data->whole_window );
+        }
         else XWithdrawWindow( data->display, data->whole_window, data->vis.screen );
         break;
     case MAKELONG(NormalState, IconicState):
@@ -2137,22 +2218,39 @@ void make_window_embedded( struct x11drv_win_data *data )
  *
  * Synchronize the X window position with the Windows one
  */
-static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, const struct window_rects *old_rects )
+static void sync_window_position( struct x11drv_win_data *data, HWND insert_after, UINT swp_flags,
+                                  const struct window_rects *old_rects )
 {
     DWORD style = NtUserGetWindowLongW( data->hwnd, GWL_STYLE );
     DWORD ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
     RECT new_rect, window_rect;
     BOOL above = FALSE;
+    BOOL bottom = FALSE;
+    HWND prev = NULL;
+    BOOL zorder = FALSE;
 
     if (data->managed && ((style & WS_MINIMIZE) || data->desired_state.wm_state == IconicState)) return;
 
-    if (!(swp_flags & SWP_NOZORDER) || (swp_flags & SWP_SHOWWINDOW))
+    if (!(swp_flags & SWP_NOZORDER))
     {
         /* find window that this one must be after */
-        HWND prev = NtUserGetWindowRelative( data->hwnd, GW_HWNDPREV );
-        while (prev && !(NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE))
+        if (swp_flags & SWP_NOZORDER)
+            prev = NtUserGetWindowRelative( data->hwnd, GW_HWNDPREV );
+        else
+        {
+            if (insert_after == HWND_TOP || insert_after == HWND_TOPMOST)
+                above = TRUE;
+            else if (insert_after == HWND_BOTTOM)
+                bottom = TRUE;
+            else if (insert_after != HWND_NOTOPMOST)
+                prev = insert_after;
+        }
+        if (!bottom && !prev && !above)
+            prev = NtUserGetWindowRelative( data->hwnd, GW_HWNDPREV );
+        while (!bottom && prev && !(NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE))
             prev = NtUserGetWindowRelative( prev, GW_HWNDPREV );
-        if (!prev) above = TRUE;  /* top child */
+        if (!bottom && !prev && !above) above = TRUE;  /* top child */
+        zorder = TRUE;
         /* should use stack_mode Below but most window managers don't get it right */
         /* and Above with a sibling doesn't work so well either, so we ignore it */
     }
@@ -2169,6 +2267,7 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
                                         window_rect.top - old_rects->window.top );
 
     window_set_config( data, new_rect, above );
+    if (zorder) sync_child_window_z_order( data, prev, above, bottom );
 }
 
 
@@ -2426,6 +2525,15 @@ static void create_whole_window( struct x11drv_win_data *data )
     DWORD layered_flags;
     HRGN win_rgn;
     POINT pos;
+    HWND parent;
+    Window xparent = root_window;
+    BOOL child;
+
+    child = (NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_CHILD)
+            && (parent = NtUserGetAncestor( data->hwnd, GA_PARENT ))
+            && parent != NtUserGetDesktopWindow();
+    if (child && (!(xparent = X11DRV_get_whole_window( parent )) || xparent == root_window))
+        child = FALSE;
 
     if ((win_rgn = NtGdiCreateRectRgn( 0, 0, 0, 0 )) &&
         NtUserGetWindowRgnEx( data->hwnd, win_rgn, 0 ) == ERROR)
@@ -2447,11 +2555,21 @@ static void create_whole_window( struct x11drv_win_data *data )
     if (!(cy = data->rects.visible.bottom - data->rects.visible.top)) cy = 1;
     else if (cy > 65535) cy = 65535;
 
-    pos = virtual_screen_to_root( data->rects.visible.left, data->rects.visible.top );
-    data->whole_window = XCreateWindow( data->display, root_window, pos.x, pos.y,
+    if (child)
+    {
+        pos.x = data->rects.visible.left;
+        pos.y = data->rects.visible.top;
+    }
+    else pos = virtual_screen_to_root( data->rects.visible.left, data->rects.visible.top );
+    data->whole_window = XCreateWindow( data->display, xparent, pos.x, pos.y,
                                         cx, cy, 0, data->vis.depth, InputOutput,
                                         data->vis.visual, mask, &attr );
     if (!data->whole_window) goto done;
+    if (child)
+    {
+        data->managed = FALSE;
+        set_window_parent( data, xparent );
+    }
     SetRect( &data->current_state.rect, pos.x, pos.y, pos.x + cx, pos.y + cy );
     data->pending_state.rect = data->current_state.rect;
     data->desired_state.rect = data->current_state.rect;
@@ -2862,8 +2980,12 @@ static struct x11drv_win_data *X11DRV_create_win_data( HWND hwnd, const struct w
     if (!(data = alloc_win_data( display, hwnd ))) return NULL;
     data->rects = *rects;
 
-    if (parent == NtUserGetDesktopWindow())
+    if (parent == NtUserGetDesktopWindow()
+            || (NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED))
     {
+        /* Ordinary child windows draw through their parent surface. Layered
+         * child windows are different: UpdateLayeredWindow needs an X11
+         * window of their own so the driver can publish their alpha pixels. */
         create_whole_window( data );
         TRACE( "win %p/%lx window %s whole %s client %s\n",
                hwnd, data->whole_window, wine_dbgstr_rect( &data->rects.window ),
@@ -3164,13 +3286,53 @@ void X11DRV_SetParent( HWND hwnd, HWND parent, HWND old_parent )
     {
         if (old_parent == NtUserGetDesktopWindow())
         {
+            HWND toplevel;
+            Window parent_window;
+
+            /* Layered windows own independent native surfaces after becoming
+             * children. Ordinary children draw through their parent and must
+             * not retain an opaque native window over that parent's content. */
+            toplevel = NtUserGetAncestor( parent, GA_ROOT );
+            parent_window = X11DRV_get_whole_window( toplevel );
+            if (data->whole_window && parent_window
+                    && (NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED))
+            {
+                TRACE( "preserving child window %p/%lx under top-level %p/%lx\n",
+                       data->hwnd, data->whole_window, toplevel, parent_window );
+                set_window_parent( data, parent_window );
+                XReparentWindow( data->display, data->whole_window, parent_window, 0, 0 );
+                data->managed = FALSE;
+                data->preserved_child = TRUE;
+                sync_window_style( data );
+                TRACE( "preserved child window %p/%lx now has X11 parent %lx, visible %u managed %u preserved %u\n",
+                       data->hwnd, data->whole_window, parent_window,
+                       !!(NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_VISIBLE ),
+                       data->managed, data->preserved_child );
+                XFlush( data->display );
+                goto done;
+            }
+
             /* destroy the old X windows */
             destroy_whole_window( data, FALSE );
         }
     }
     else  /* new top level window */
     {
-        create_whole_window( data );
+        if (data->preserved_child && data->whole_window)
+        {
+            TRACE( "restoring preserved child window %p/%lx to the root\n", data->hwnd, data->whole_window );
+            XReparentWindow( data->display, data->whole_window, root_window, 0, 0 );
+            set_window_parent( data, root_window );
+            data->managed = TRUE;
+            data->preserved_child = FALSE;
+            sync_window_style( data );
+            TRACE( "restored window %p/%lx to X11 root %lx, visible %u managed %u preserved %u\n",
+                   data->hwnd, data->whole_window, root_window,
+                   !!(NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_VISIBLE ),
+                   data->managed, data->preserved_child );
+            XFlush( data->display );
+        }
+        else create_whole_window( data );
     }
 done:
     release_win_data( data );
@@ -3281,8 +3443,9 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->is_fullscreen = fullscreen;
     data->is_resizable = !!(swp_flags & WINE_SWP_RESIZABLE);
 
-    TRACE( "win %p/%lx new_rects %s style %08x flags %08x\n", hwnd, data->whole_window,
-           debugstr_window_rects(new_rects), new_style, swp_flags );
+    TRACE( "win %p/%lx new_rects %s style %08x flags %08x insert_after %p\n", hwnd,
+           data->whole_window, debugstr_window_rects(new_rects), new_style, swp_flags,
+           insert_after );
 
     /* visible windows are only hidden after SWP_HIDEWINDOW is used */
     if (data->desired_state.wm_state != WithdrawnState && !(new_style & WS_VISIBLE) &&
@@ -3311,7 +3474,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* don't change position if we are about to minimize or maximize a managed window */
     if (!(data->managed && (swp_flags & SWP_STATECHANGED) && (new_style & (WS_MINIMIZE|WS_MAXIMIZE))))
     {
-        sync_window_position( data, swp_flags, &old_rects );
+        sync_window_position( data, insert_after, swp_flags, &old_rects );
 #ifdef HAVE_LIBXSHAPE
         if (IsRectEmpty( &old_rects.window ) != IsRectEmpty( &new_rects->window ))
             sync_empty_window_shape( data, surface );

@@ -1588,6 +1588,7 @@ enum wined3d_memory_segment_group
 #define WINED3D_TEXTURE_CREATE_GET_DC                           0x00000008
 #define WINED3D_TEXTURE_CREATE_GENERATE_MIPMAPS                 0x00000010
 #define WINED3D_TEXTURE_CREATE_RECORD_DIRTY_REGIONS             0x00000020
+#define WINED3D_TEXTURE_CREATE_SHARED                           0x00000040
 
 #define WINED3D_STANDARD_MULTISAMPLE_PATTERN                    0xffffffff
 
@@ -1822,6 +1823,25 @@ struct wined3d_resource_desc
     unsigned int height;
     unsigned int depth;
     unsigned int size;
+};
+
+struct wined3d_shared_resource_desc
+{
+    enum wined3d_resource_type resource_type;
+    UINT dxgi_format;
+    UINT width;
+    UINT height;
+    UINT depth;
+    UINT mip_levels;
+    UINT array_size;
+    UINT sample_count;
+    UINT sample_quality;
+    UINT usage;
+    UINT bind_flags;
+    UINT cpu_access_flags;
+    UINT misc_flags;
+    UINT mutex_handle;
+    UINT sync_handle;
 };
 
 struct wined3d_sub_resource_desc
@@ -2750,6 +2770,7 @@ ULONG __cdecl wined3d_rasterizer_state_incref(struct wined3d_rasterizer_state *s
 
 void __cdecl wined3d_resource_get_desc(const struct wined3d_resource *resource,
         struct wined3d_resource_desc *desc);
+HRESULT __cdecl wined3d_resource_get_shared_handle(struct wined3d_resource *resource, HANDLE *shared_handle);
 void * __cdecl wined3d_resource_get_parent(const struct wined3d_resource *resource);
 unsigned int __cdecl wined3d_resource_get_priority(const struct wined3d_resource *resource);
 unsigned int __cdecl wined3d_resource_get_sub_resource_count(struct wined3d_resource *resource);
@@ -2948,6 +2969,11 @@ HRESULT __cdecl wined3d_texture_add_dirty_region(struct wined3d_texture *texture
 HRESULT __cdecl wined3d_texture_create(struct wined3d_device *device, const struct wined3d_resource_desc *desc,
         UINT layer_count, unsigned int level_count, uint32_t flags, const struct wined3d_sub_resource_data *data,
         void *parent, const struct wined3d_parent_ops *parent_ops, struct wined3d_texture **texture);
+HRESULT __cdecl wined3d_texture_create_shared(struct wined3d_device *device, HANDLE shared_handle,
+        void *parent, const struct wined3d_parent_ops *parent_ops, struct wined3d_resource_desc *desc,
+        unsigned int *layer_count, unsigned int *level_count, struct wined3d_texture **texture);
+void __cdecl wined3d_texture_set_shared_desc(struct wined3d_texture *texture,
+        const struct wined3d_shared_resource_desc *desc);
 struct wined3d_texture * __cdecl wined3d_texture_from_resource(struct wined3d_resource *resource);
 ULONG __cdecl wined3d_texture_decref(struct wined3d_texture *texture);
 HRESULT __cdecl wined3d_texture_get_dc(struct wined3d_texture *texture, unsigned int sub_resource_idx, HDC *dc);

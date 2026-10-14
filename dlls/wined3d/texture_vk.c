@@ -872,9 +872,20 @@ BOOL wined3d_texture_vk_prepare_texture(struct wined3d_texture_vk *texture_vk,
         texture_vk->layout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
-    if (!wined3d_context_vk_create_image(context_vk, vk_image_type, vk_usage, format_vk->vk_format,
-            resource->width, resource->height, resource->depth, max(1, wined3d_resource_get_sample_count(resource)),
-            texture_vk->t.level_count, texture_vk->t.layer_count, flags, NULL, &texture_vk->image))
+    if (texture_vk->shared
+            ? (texture_vk->shared_import
+                    ? !wined3d_context_vk_create_imported_image(context_vk, vk_image_type, vk_usage, format_vk->vk_format,
+                            resource->width, resource->height, resource->depth,
+                            max(1, wined3d_resource_get_sample_count(resource)), texture_vk->t.level_count,
+                            texture_vk->t.layer_count, flags, texture_vk->shared_handle, &texture_vk->image)
+                    : !wined3d_context_vk_create_shared_image(context_vk, vk_image_type, vk_usage, format_vk->vk_format,
+                            resource->width, resource->height, resource->depth,
+                            max(1, wined3d_resource_get_sample_count(resource)), texture_vk->t.level_count,
+                            texture_vk->t.layer_count, flags, &texture_vk->image))
+            : !wined3d_context_vk_create_image(context_vk, vk_image_type, vk_usage, format_vk->vk_format,
+                    resource->width, resource->height, resource->depth,
+                    max(1, wined3d_resource_get_sample_count(resource)), texture_vk->t.level_count,
+                    texture_vk->t.layer_count, flags, NULL, &texture_vk->image))
     {
         return FALSE;
     }
@@ -1044,6 +1055,11 @@ HRESULT wined3d_texture_vk_init(struct wined3d_texture_vk *texture_vk, struct wi
             "level_count %u, flags %#x, parent %p, parent_ops %p.\n",
             texture_vk, device, desc, layer_count,
             level_count, flags, parent, parent_ops);
+
+    texture_vk->shared = !!(flags & WINED3D_TEXTURE_CREATE_SHARED);
+    texture_vk->shared_import = FALSE;
+    texture_vk->shared_handle = NULL;
+    texture_vk->shared_global = 0;
 
     return wined3d_texture_init(&texture_vk->t, desc, layer_count, level_count,
             flags, device, parent, parent_ops, &texture_vk[1], &wined3d_texture_vk_ops);

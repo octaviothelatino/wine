@@ -170,6 +170,12 @@ HRESULT dxgi_adapter_create(struct dxgi_factory *factory, UINT ordinal,
         struct dxgi_adapter **adapter);
 struct dxgi_adapter *unsafe_impl_from_IDXGIAdapter(IDXGIAdapter *iface);
 
+enum dxgi_swapchain_type
+{
+    DXGI_SWAPCHAIN_TYPE_HWND,
+    DXGI_SWAPCHAIN_TYPE_COMPOSITION,
+};
+
 /* IDXGISwapChain */
 struct d3d11_swapchain
 {
@@ -181,14 +187,20 @@ struct d3d11_swapchain
     IWineDXGIDevice *device;
     IWineDXGIFactory *factory;
 
+    enum dxgi_swapchain_type type;
+    HWND window;
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc;
+    DXGI_ALPHA_MODE alpha_mode;
     IDXGIOutput *target;
     LONG present_count;
+    UINT buffer_count;
+    LONG current_buffer_idx;
     LONG in_set_fullscreen_state;
 };
 
 HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,
-        struct wined3d_swapchain_desc *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc);
+        struct wined3d_swapchain_desc *desc, DXGI_ALPHA_MODE alpha_mode,
+        const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc);
 
 HRESULT d3d12_swapchain_create(IWineDXGIFactory *factory, ID3D12CommandQueue *queue, HWND window,
         const DXGI_SWAP_CHAIN_DESC1 *swapchain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc,

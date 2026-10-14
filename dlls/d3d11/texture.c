@@ -511,6 +511,8 @@ HRESULT d3d_texture1d_create(struct d3d_device *device, const D3D11_TEXTURE1D_DE
 
 /* ID3D11Texture2D methods */
 
+static const struct IDXGIKeyedMutexVtbl d3d_texture2d_keyed_mutex_vtbl;
+
 static HRESULT STDMETHODCALLTYPE d3d11_texture2d_QueryInterface(ID3D11Texture2D *iface, REFIID riid, void **object)
 {
     struct d3d_texture2d *texture = impl_from_ID3D11Texture2D(iface);
@@ -524,6 +526,12 @@ static HRESULT STDMETHODCALLTYPE d3d11_texture2d_QueryInterface(ID3D11Texture2D 
             || IsEqualGUID(riid, &IID_IUnknown))
     {
         *object = &texture->ID3D11Texture2D_iface;
+        IUnknown_AddRef((IUnknown *)*object);
+        return S_OK;
+    }
+    else if (IsEqualGUID(riid, &IID_IDXGIKeyedMutex) && texture->keyed_mutex)
+    {
+        *object = &texture->IDXGIKeyedMutex_iface;
         IUnknown_AddRef((IUnknown *)*object);
         return S_OK;
     }
@@ -575,8 +583,16 @@ static ULONG STDMETHODCALLTYPE d3d11_texture2d_Release(ID3D11Texture2D *iface)
     if (!refcount)
     {
         ID3D11Device5 *device = texture->device;
+        D3DKMT_DESTROYKEYEDMUTEX destroy = {0};
+
         if (texture->swapchain)
             wined3d_swapchain_decref(texture->swapchain);
+        if (texture->keyed_mutex)
+        {
+            destroy.hKeyedMutex = texture->keyed_mutex;
+            D3DKMTDestroyKeyedMutex(&destroy);
+            texture->keyed_mutex = 0;
+        }
         /* Releasing the texture may free the d3d11 object, so do not access it
          * after releasing the texture. */
         wined3d_texture_decref(texture->wined3d_texture);
@@ -713,6 +729,167 @@ static const struct ID3D11Texture2DVtbl d3d11_texture2d_vtbl =
     d3d11_texture2d_GetEvictionPriority,
     /* ID3D11Texture2D methods */
     d3d11_texture2d_GetDesc,
+};
+
+static inline struct d3d_texture2d *impl_from_IDXGIKeyedMutex(IDXGIKeyedMutex *iface)
+{
+    return CONTAINING_RECORD(iface, struct d3d_texture2d, IDXGIKeyedMutex_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_QueryInterface(IDXGIKeyedMutex *iface,
+        REFIID riid, void **object)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+
+    return d3d11_texture2d_QueryInterface(&texture->ID3D11Texture2D_iface, riid, object);
+}
+
+static ULONG STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_AddRef(IDXGIKeyedMutex *iface)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+
+    return d3d11_texture2d_AddRef(&texture->ID3D11Texture2D_iface);
+}
+
+static ULONG STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_Release(IDXGIKeyedMutex *iface)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+
+    return d3d11_texture2d_Release(&texture->ID3D11Texture2D_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_SetPrivateData(IDXGIKeyedMutex *iface,
+        REFGUID guid, UINT data_size, const void *data)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+    IDXGIObject *object;
+    HRESULT hr;
+
+    if (FAILED(hr = IUnknown_QueryInterface(texture->dxgi_resource, &IID_IDXGIObject, (void **)&object)))
+        return hr;
+    hr = IDXGIObject_SetPrivateData(object, guid, data_size, data);
+    IDXGIObject_Release(object);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_SetPrivateDataInterface(IDXGIKeyedMutex *iface,
+        REFGUID guid, const IUnknown *data)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+    IDXGIObject *object;
+    HRESULT hr;
+
+    if (FAILED(hr = IUnknown_QueryInterface(texture->dxgi_resource, &IID_IDXGIObject, (void **)&object)))
+        return hr;
+    hr = IDXGIObject_SetPrivateDataInterface(object, guid, data);
+    IDXGIObject_Release(object);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_GetPrivateData(IDXGIKeyedMutex *iface,
+        REFGUID guid, UINT *data_size, void *data)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+    IDXGIObject *object;
+    HRESULT hr;
+
+    if (FAILED(hr = IUnknown_QueryInterface(texture->dxgi_resource, &IID_IDXGIObject, (void **)&object)))
+        return hr;
+    hr = IDXGIObject_GetPrivateData(object, guid, data_size, data);
+    IDXGIObject_Release(object);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_GetParent(IDXGIKeyedMutex *iface,
+        REFIID riid, void **parent)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+    IDXGIObject *object;
+    HRESULT hr;
+
+    if (FAILED(hr = IUnknown_QueryInterface(texture->dxgi_resource, &IID_IDXGIObject, (void **)&object)))
+        return hr;
+    hr = IDXGIObject_GetParent(object, riid, parent);
+    IDXGIObject_Release(object);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_GetDevice(IDXGIKeyedMutex *iface,
+        REFIID riid, void **device)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+    IDXGIResource1 *resource;
+    HRESULT hr;
+
+    if (FAILED(hr = IUnknown_QueryInterface(texture->dxgi_resource, &IID_IDXGIResource1, (void **)&resource)))
+        return hr;
+    hr = IDXGIResource1_GetDevice(resource, riid, device);
+    IDXGIResource1_Release(resource);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_AcquireSync(IDXGIKeyedMutex *iface,
+        UINT64 key, DWORD milliseconds)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+    D3DKMT_ACQUIREKEYEDMUTEX acquire = {0};
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    if (!texture->keyed_mutex || InterlockedCompareExchange(&texture->keyed_mutex_owned, 1, 0))
+        return DXGI_ERROR_INVALID_CALL;
+
+    acquire.hKeyedMutex = texture->keyed_mutex;
+    acquire.Key = key;
+    if (milliseconds != INFINITE)
+    {
+        timeout.QuadPart = -(LONGLONG)milliseconds * 10000;
+        acquire.pTimeout = &timeout;
+    }
+
+    status = D3DKMTAcquireKeyedMutex(&acquire);
+    if (!status)
+        return S_OK;
+
+    InterlockedExchange(&texture->keyed_mutex_owned, 0);
+    if (status == STATUS_TIMEOUT)
+        return WAIT_TIMEOUT;
+    if (status == WAIT_ABANDONED)
+        return WAIT_ABANDONED;
+    return DXGI_ERROR_INVALID_CALL;
+}
+
+static HRESULT STDMETHODCALLTYPE d3d_texture2d_keyed_mutex_ReleaseSync(IDXGIKeyedMutex *iface, UINT64 key)
+{
+    struct d3d_texture2d *texture = impl_from_IDXGIKeyedMutex(iface);
+    D3DKMT_RELEASEKEYEDMUTEX release = {0};
+    NTSTATUS status;
+
+    if (!texture->keyed_mutex || InterlockedCompareExchange(&texture->keyed_mutex_owned, 0, 1) != 1)
+        return DXGI_ERROR_INVALID_CALL;
+
+    release.hKeyedMutex = texture->keyed_mutex;
+    release.Key = key;
+    status = D3DKMTReleaseKeyedMutex(&release);
+    if (!status)
+        return S_OK;
+
+    InterlockedExchange(&texture->keyed_mutex_owned, 1);
+    return DXGI_ERROR_INVALID_CALL;
+}
+
+static const struct IDXGIKeyedMutexVtbl d3d_texture2d_keyed_mutex_vtbl =
+{
+    d3d_texture2d_keyed_mutex_QueryInterface,
+    d3d_texture2d_keyed_mutex_AddRef,
+    d3d_texture2d_keyed_mutex_Release,
+    d3d_texture2d_keyed_mutex_SetPrivateData,
+    d3d_texture2d_keyed_mutex_SetPrivateDataInterface,
+    d3d_texture2d_keyed_mutex_GetPrivateData,
+    d3d_texture2d_keyed_mutex_GetParent,
+    d3d_texture2d_keyed_mutex_GetDevice,
+    d3d_texture2d_keyed_mutex_AcquireSync,
+    d3d_texture2d_keyed_mutex_ReleaseSync,
 };
 
 struct d3d_texture2d *unsafe_impl_from_ID3D11Texture2D(ID3D11Texture2D *iface)
@@ -961,6 +1138,40 @@ static BOOL validate_texture2d_desc(const D3D11_TEXTURE2D_DESC *desc, D3D_FEATUR
     return TRUE;
 }
 
+static void d3d_texture2d_set_shared_desc(struct d3d_texture2d *texture)
+{
+    struct wined3d_shared_resource_desc shared_desc;
+
+    if (!(texture->desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED
+            | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)))
+        return;
+
+    shared_desc.resource_type = WINED3D_RTYPE_TEXTURE_2D;
+    shared_desc.dxgi_format = texture->desc.Format;
+    shared_desc.width = texture->desc.Width;
+    shared_desc.height = texture->desc.Height;
+    shared_desc.depth = 1;
+    shared_desc.mip_levels = texture->desc.MipLevels;
+    shared_desc.array_size = texture->desc.ArraySize;
+    shared_desc.sample_count = texture->desc.SampleDesc.Count;
+    shared_desc.sample_quality = texture->desc.SampleDesc.Quality;
+    shared_desc.usage = texture->desc.Usage;
+    shared_desc.bind_flags = texture->desc.BindFlags;
+    shared_desc.cpu_access_flags = texture->desc.CPUAccessFlags;
+    shared_desc.misc_flags = texture->desc.MiscFlags;
+    shared_desc.mutex_handle = texture->keyed_mutex_global;
+    shared_desc.sync_handle = 0;
+    wined3d_texture_set_shared_desc(texture->wined3d_texture, &shared_desc);
+}
+
+void d3d_texture2d_set_shared_mutex(struct d3d_texture2d *texture,
+        D3DKMT_HANDLE local, D3DKMT_HANDLE global)
+{
+    texture->keyed_mutex = local;
+    texture->keyed_mutex_global = global;
+    d3d_texture2d_set_shared_desc(texture);
+}
+
 HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DESC *desc,
         struct wined3d_texture *wined3d_texture, const D3D11_SUBRESOURCE_DATA *data, struct d3d_texture2d **out)
 {
@@ -980,6 +1191,7 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
 
     texture->ID3D11Texture2D_iface.lpVtbl = &d3d11_texture2d_vtbl;
     texture->ID3D10Texture2D_iface.lpVtbl = &d3d10_texture2d_vtbl;
+    texture->IDXGIKeyedMutex_iface.lpVtbl = &d3d_texture2d_keyed_mutex_vtbl;
     texture->refcount = 1;
     wined3d_mutex_lock();
     texture->desc = *desc;
@@ -1018,6 +1230,9 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
             flags |= WINED3D_TEXTURE_CREATE_GET_DC;
         if (desc->MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS)
             flags |= WINED3D_TEXTURE_CREATE_GENERATE_MIPMAPS;
+        if (desc->MiscFlags & (D3D11_RESOURCE_MISC_SHARED
+                | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+            flags |= WINED3D_TEXTURE_CREATE_SHARED;
 
         if (FAILED(hr = wined3d_texture_create(device->wined3d_device, &wined3d_desc,
                 desc->ArraySize, levels, flags, (struct wined3d_sub_resource_data *)data,
@@ -1033,6 +1248,25 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
         texture->desc.MipLevels = levels;
     }
 
+    if (!wined3d_texture && (desc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+    {
+        D3DKMT_CREATEKEYEDMUTEX create = {0};
+        NTSTATUS status;
+
+        if ((status = D3DKMTCreateKeyedMutex(&create)))
+        {
+            WARN("Failed to create keyed mutex, status %#lx.\n", status);
+            wined3d_texture_decref(texture->wined3d_texture);
+            wined3d_mutex_unlock();
+            free(texture);
+            return E_FAIL;
+        }
+        texture->keyed_mutex = create.hKeyedMutex;
+        texture->keyed_mutex_global = create.hSharedHandle;
+    }
+
+    d3d_texture2d_set_shared_desc(texture);
+
     needs_surface = desc->MipLevels == 1 && desc->ArraySize == 1;
     hr = d3d_device_create_dxgi_resource((IUnknown *)&device->ID3D10Device1_iface,
             wined3d_texture_get_resource(texture->wined3d_texture), (IUnknown *)&texture->ID3D10Texture2D_iface,
@@ -1040,6 +1274,11 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
     if (FAILED(hr))
     {
         ERR("Failed to create DXGI resource, returning %#.lx\n", hr);
+        if (texture->keyed_mutex)
+        {
+            D3DKMT_DESTROYKEYEDMUTEX destroy = {.hKeyedMutex = texture->keyed_mutex};
+            D3DKMTDestroyKeyedMutex(&destroy);
+        }
         wined3d_texture_decref(texture->wined3d_texture);
         wined3d_mutex_unlock();
         return hr;
