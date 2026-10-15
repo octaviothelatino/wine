@@ -441,7 +441,10 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
 
     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                      surface->hdc_src, 0, 0, rect_src.right - rect_src.left, rect_src.bottom - rect_src.top, SRCCOPY, 0 );
-    X11DRV_XRender_CompositeChildren( window, destination, surface->composited_children, region );
+    /* The client DC region clips this client's pixels, not independently
+     * redirected siblings. Those may extend outside the client viewport.
+     * Their own shapes and the final parent-window copy provide clipping. */
+    X11DRV_XRender_CompositeChildren( window, destination, surface->composited_children, 0 );
     if (destination != window)
         XCopyArea( gdi_display, destination, window, surface->composition_gc, 0, 0,
                    surface->composition_width, surface->composition_height, 0, 0 );
