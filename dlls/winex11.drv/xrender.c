@@ -282,7 +282,8 @@ void X11DRV_XRender_PrepareChildren( Window parent, void **state )
 
         X11DRV_expect_error( gdi_display, child_composition_error, NULL );
         valid = XGetWindowAttributes( gdi_display, children[i], &attributes );
-        XSync( gdi_display, False );
+        /* The attribute query has already waited for its reply and handled
+         * errors from that request. Do not add a second server round trip. */
         error = X11DRV_check_error();
         if (!valid || error || attributes.map_state != IsViewable || attributes.depth != 32) continue;
         format = pXRenderFindVisualFormat( gdi_display, attributes.visual );
@@ -346,7 +347,6 @@ void X11DRV_XRender_CompositeChildren( Window parent, Drawable drawable, void *s
             XUnionRectWithRegion( (XRectangle *)data->Buffer + i, visible, visible );
     }
     destination = pXRenderCreatePicture( gdi_display, drawable, format, CPSubwindowMode, &pa );
-    X11DRV_expect_error( gdi_display, child_composition_error, NULL );
     for (child = state; child; child = child->next)
     {
         Region shape = XCreateRegion();
@@ -381,8 +381,9 @@ void X11DRV_XRender_CompositeChildren( Window parent, Drawable drawable, void *s
         XDestroyRegion( shape );
     }
     pXRenderFreePicture( gdi_display, destination );
-    XSync( gdi_display, False );
-    X11DRV_check_error();
+    /* Render and the following completed-frame copy use the same connection.
+     * Their ordering does not require a synchronous server round trip.
+     * The normal GDI error handler handles children destroyed concurrently. */
     if (visible) XDestroyRegion( visible );
     free( data );
 }
