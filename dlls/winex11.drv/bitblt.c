@@ -1589,6 +1589,8 @@ struct x11drv_window_surface
     GC                    gc;
     struct x11drv_image  *image;
     BOOL                  byteswap;
+    Pixmap                alpha_pixmap;
+    GC                    alpha_gc;
 };
 
 static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
@@ -1792,11 +1794,15 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
                                   const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
                                   const BITMAPINFO *shape_info, const void *shape_bits )
 {
+    static unsigned int debug_flush_count;
     UINT alpha_mask = window_surface->alpha_mask, alpha_bits = window_surface->alpha_bits;
     struct x11drv_window_surface *surface = get_x11_surface( window_surface );
     XImage *ximage = surface->image->ximage;
     const unsigned char *src = color_bits;
     unsigned char *dst = (unsigned char *)ximage->data;
+    BOOL debug_flush = TRACE_ON(bitblt) && window_surface->hwnd && ximage->depth == 32 &&
+                       color_info->bmiHeader.biWidth > 256 && debug_flush_count < 12;
+    unsigned int debug_index = debug_flush ? debug_flush_count++ : 0;
 
     if (alpha_bits == -1)
     {
@@ -1807,6 +1813,53 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
             DWORD *colors = (DWORD *)color_info->bmiColors;
             alpha_bits = ~(colors[0] | colors[1] | colors[2]);
         }
+    }
+
+    if (debug_flush)
+    {
+        unsigned int height = abs( color_info->bmiHeader.biHeight );
+        unsigned int stride = height ? color_info->bmiHeader.biSizeImage / height : 0;
+        unsigned int src_sample[4] = {0}, dst_sample[4] = {0};
+        unsigned int shape_first = 0, shape_middle = 0;
+
+        if (color_info->bmiHeader.biBitCount == 32 && color_info->bmiHeader.biWidth > 0 &&
+            stride >= color_info->bmiHeader.biWidth * 4 && height)
+        {
+            const unsigned char *src_mid = (const unsigned char *)color_bits +
+                (height / 2) * stride + (color_info->bmiHeader.biWidth / 2) * 4;
+            src_sample[0] = src_mid[0];
+            src_sample[1] = src_mid[1];
+            src_sample[2] = src_mid[2];
+            src_sample[3] = src_mid[3];
+        }
+        if (ximage->bits_per_pixel == 32 && color_info->bmiHeader.biWidth > 0 &&
+            ximage->bytes_per_line >= color_info->bmiHeader.biWidth * 4 && height)
+        {
+            const unsigned char *dst_mid = (const unsigned char *)ximage->data +
+                (height / 2) * ximage->bytes_per_line + (color_info->bmiHeader.biWidth / 2) * 4;
+            dst_sample[0] = dst_mid[0];
+            dst_sample[1] = dst_mid[1];
+            dst_sample[2] = dst_mid[2];
+            dst_sample[3] = dst_mid[3];
+        }
+        if (shape_bits && shape_info->bmiHeader.biSizeImage)
+        {
+            unsigned int shape_stride = shape_info->bmiHeader.biSizeImage / height;
+            shape_first = ((const unsigned char *)shape_bits)[0];
+            shape_middle = ((const unsigned char *)shape_bits)[(height / 2) * shape_stride
+                    + shape_info->bmiHeader.biWidth / 16];
+        }
+
+        TRACE( "surface_flush[%u] hwnd %p xwindow %lx dirty %s alpha_mask %#x alpha_bits %#x "
+               "color %ux%u bpp %u compression %#x ximage depth %d bpp %d byte_order %d byteswap %u "
+               "shape_changed %u shape_first %02x shape_middle %02x "
+               "src %02x %02x %02x %02x dst %02x %02x %02x %02x\n", debug_index,
+               window_surface->hwnd, surface->window, wine_dbgstr_rect( dirty ), alpha_mask, alpha_bits,
+               color_info->bmiHeader.biWidth, height, color_info->bmiHeader.biBitCount,
+               color_info->bmiHeader.biCompression, ximage->depth, ximage->bits_per_pixel,
+               ximage->byte_order, surface->byteswap, shape_changed, shape_first, shape_middle,
+               src_sample[0], src_sample[1], src_sample[2], src_sample[3],
+               dst_sample[0], dst_sample[1], dst_sample[2], dst_sample[3] );
     }
 
     if (src != dst)
@@ -1848,12 +1901,55 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
 #endif /* HAVE_LIBXSHAPE */
     }
 
+    if (alpha_mask && ximage->depth == 32)
+    {
+        RECT origin = {0};
+
+        /* Core window image writes can discard alpha. Upload to a pixmap,
+         * then use Render's explicitly alpha-aware source copy. */
+        if (!surface->alpha_pixmap)
+        {
+            surface->alpha_pixmap = XCreatePixmap( gdi_display, surface->window,
+                                                   ximage->width, ximage->height, 32 );
+            surface->alpha_gc = XCreateGC( gdi_display, surface->alpha_pixmap, 0, NULL );
+        }
+        if (!put_shm_image( ximage, &surface->image->shminfo, surface->alpha_pixmap,
+                            surface->alpha_gc, &origin, dirty ))
+            XPutImage( gdi_display, surface->alpha_pixmap, surface->alpha_gc, ximage,
+                       dirty->left, dirty->top, dirty->left, dirty->top,
+                       dirty->right - dirty->left, dirty->bottom - dirty->top );
+        if (X11DRV_XRender_CopyAlpha( surface->alpha_pixmap, surface->window, rect, dirty,
+                                     window_surface->clip_region ))
+            goto flushed;
+    }
+
     if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
                    dirty->right - dirty->left, dirty->bottom - dirty->top );
 
+flushed:
     XFlush( gdi_display );
+
+    if (debug_flush)
+    {
+        unsigned int height = abs( color_info->bmiHeader.biHeight );
+        unsigned int dst_sample[4] = {0};
+
+        if (ximage->bits_per_pixel == 32 && color_info->bmiHeader.biWidth > 0 &&
+            ximage->bytes_per_line >= color_info->bmiHeader.biWidth * 4 && height)
+        {
+            const unsigned char *dst_mid = (const unsigned char *)ximage->data +
+                (height / 2) * ximage->bytes_per_line + (color_info->bmiHeader.biWidth / 2) * 4;
+            dst_sample[0] = dst_mid[0];
+            dst_sample[1] = dst_mid[1];
+            dst_sample[2] = dst_mid[2];
+            dst_sample[3] = dst_mid[3];
+        }
+
+        TRACE( "surface_flush[%u] after_put dst %02x %02x %02x %02x\n", debug_index,
+               dst_sample[0], dst_sample[1], dst_sample[2], dst_sample[3] );
+    }
 
     return TRUE;
 }
@@ -1867,6 +1963,8 @@ static void x11drv_surface_destroy( struct window_surface *window_surface )
 
     TRACE( "freeing %p\n", surface );
     if (surface->gc) XFreeGC( gdi_display, surface->gc );
+    if (surface->alpha_gc) XFreeGC( gdi_display, surface->alpha_gc );
+    if (surface->alpha_pixmap) XFreePixmap( gdi_display, surface->alpha_pixmap );
     if (surface->image) x11drv_image_destroy( surface->image );
 }
 
@@ -1945,7 +2043,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
         surface->byteswap = byteswap;
         surface->window = window;
         surface->gc = XCreateGC( gdi_display, window, 0, NULL );
-        XSetSubwindowMode( gdi_display, surface->gc, IncludeInferiors );
+        XSetSubwindowMode( gdi_display, surface->gc, ClipByChildren );
     }
 
     return window_surface;
@@ -1967,6 +2065,7 @@ static BOOL enable_direct_drawing( struct x11drv_win_data *data, BOOL layered )
  */
 BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
 {
+    static unsigned int debug_surface_count;
     struct window_surface *previous;
     struct x11drv_win_data *data;
 
@@ -1991,6 +2090,15 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
     {
         *surface = NULL;  /* indicate that we want to draw directly to the window */
         goto done; /* draw directly to the window */
+    }
+
+    if (TRACE_ON(bitblt) && layered && debug_surface_count < 80)
+    {
+        TRACE( "surface_create[%u] hwnd %p layered %u xwindow %lx embedded %u preserved %u "
+               "use_alpha %u visual %#lx depth %d argb_visual %#lx argb_depth %d rect %s\n",
+               debug_surface_count++, hwnd, layered, data->whole_window, data->embedded,
+               data->preserved_child, data->use_alpha, data->vis.visualid, data->vis.depth,
+               argb_visual.visualid, argb_visual.depth, wine_dbgstr_rect( surface_rect ) );
     }
 
     *surface = create_surface( data->hwnd, data->whole_window, &data->vis, surface_rect,

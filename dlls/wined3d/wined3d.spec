@@ -209,6 +209,7 @@
 @ cdecl wined3d_rendertarget_view_set_parent(ptr ptr ptr)
 
 @ cdecl wined3d_resource_get_desc(ptr ptr)
+@ cdecl wined3d_resource_get_shared_handle(ptr ptr)
 @ cdecl wined3d_resource_get_parent(ptr)
 @ cdecl wined3d_resource_get_priority(ptr)
 @ cdecl wined3d_resource_get_sub_resource_count(ptr)
@@ -327,6 +328,7 @@
 @ cdecl wined3d_texture_acquire_identity_srv(ptr)
 @ cdecl wined3d_texture_add_dirty_region(ptr long ptr)
 @ cdecl wined3d_texture_create(ptr ptr long long long ptr ptr ptr ptr)
+@ cdecl wined3d_texture_create_shared(ptr ptr ptr ptr ptr ptr ptr ptr)
 @ cdecl wined3d_texture_decref(ptr)
 @ cdecl wined3d_texture_from_resource(ptr)
 @ cdecl wined3d_texture_get_dc(ptr long ptr)
@@ -344,6 +346,7 @@
 @ cdecl wined3d_texture_set_color_key(ptr long ptr)
 @ cdecl wined3d_texture_set_lod(ptr long)
 @ cdecl wined3d_texture_set_overlay_position(ptr long long long)
+@ cdecl wined3d_texture_set_shared_desc(ptr ptr)
 @ cdecl wined3d_texture_set_sub_resource_parent(ptr long ptr ptr)
 @ cdecl wined3d_texture_update_desc(ptr long ptr long)
 @ cdecl wined3d_texture_update_overlay(ptr long ptr ptr long ptr long)

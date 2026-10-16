@@ -35441,6 +35441,181 @@ test_done:
     ok(!ref, "got %ld.\n", ref);
 }
 
+static void test_shared_resource_process_child(void)
+{
+    ID3D11Device1 *device1 = NULL;
+    ID3D11Texture2D *texture = NULL;
+    ID3D11Device *device = NULL;
+    IDXGIKeyedMutex *keyed_mutex = NULL;
+    char **argv;
+    HANDLE handle;
+    void *handle_value;
+    HRESULT hr;
+
+    winetest_get_mainargs(&argv);
+    if (sscanf(argv[4], "%p", &handle_value) != 1)
+    {
+        ok(FALSE, "Failed to parse shared handle %s.\n", argv[4]);
+        return;
+    }
+    handle = handle_value;
+
+    if (!(device = create_device(NULL)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hr = ID3D11Device_QueryInterface(device, &IID_ID3D11Device1, (void **)&device1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    if (!strcmp(argv[3], "legacy"))
+    {
+        hr = ID3D11Device_OpenSharedResource(device, handle, &IID_ID3D11Texture2D,
+                (void **)&texture);
+    }
+    else
+    {
+        ok(!strcmp(argv[3], "nt"), "Got unexpected handle type %s.\n", argv[3]);
+        hr = ID3D11Device1_OpenSharedResource1(device1, handle, &IID_ID3D11Texture2D,
+                (void **)&texture);
+    }
+    todo_wine_if(!strcmp(argv[3], "nt"))
+    ok(hr == S_OK, "Failed to open the shared resource in the child process, hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    hr = ID3D11Texture2D_QueryInterface(texture, &IID_IDXGIKeyedMutex, (void **)&keyed_mutex);
+    todo_wine_if(!strcmp(argv[3], "nt"))
+    ok(hr == S_OK, "The opened resource has no keyed mutex, hr %#lx.\n", hr);
+
+done:
+    if (keyed_mutex)
+        IDXGIKeyedMutex_Release(keyed_mutex);
+    if (texture)
+        ID3D11Texture2D_Release(texture);
+    if (device1)
+        ID3D11Device1_Release(device1);
+    if (device)
+        ID3D11Device_Release(device);
+}
+
+static void test_shared_resource_process(void)
+{
+    static const struct
+    {
+        const char *type;
+        UINT misc_flags;
+        BOOL inherit_handle;
+    } tests[] =
+    {
+        {"legacy", D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, FALSE},
+        {"nt", D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, TRUE},
+    };
+    SECURITY_ATTRIBUTES security = {sizeof(security), NULL, TRUE};
+    ID3D11Texture2D *texture = NULL;
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Device1 *device1 = NULL;
+    ID3D11Device *device = NULL;
+    IDXGIResource1 *resource1 = NULL;
+    IDXGIResource *resource = NULL;
+    char **argv, cmd[MAX_PATH];
+    PROCESS_INFORMATION info;
+    STARTUPINFOA startup;
+    unsigned int i;
+    HANDLE handle;
+    HRESULT hr;
+
+    if (!(device = create_device(NULL)))
+    {
+        skip("Failed to create device.\n");
+        return;
+    }
+
+    hr = ID3D11Device_QueryInterface(device, &IID_ID3D11Device1, (void **)&device1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (FAILED(hr))
+        goto done;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.SampleDesc.Count = 1;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    winetest_get_mainargs(&argv);
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("%s shared handle", tests[i].type);
+        desc.MiscFlags = tests[i].misc_flags;
+        texture = NULL;
+        resource = NULL;
+        resource1 = NULL;
+        handle = NULL;
+
+        hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &texture);
+        ok(hr == S_OK, "Failed to create shared texture, hr %#lx.\n", hr);
+        if (FAILED(hr))
+            goto next;
+
+        hr = ID3D11Texture2D_QueryInterface(texture, &IID_IDXGIResource, (void **)&resource);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        hr = ID3D11Texture2D_QueryInterface(texture, &IID_IDXGIResource1, (void **)&resource1);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        if (FAILED(hr))
+            goto next;
+
+        if (tests[i].inherit_handle)
+        {
+            hr = IDXGIResource1_CreateSharedHandle(resource1, &security,
+                    GENERIC_ALL | DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                    NULL, &handle);
+        }
+        else
+        {
+            hr = IDXGIResource_GetSharedHandle(resource, &handle);
+        }
+        todo_wine_if(tests[i].inherit_handle)
+        ok(hr == S_OK, "Failed to create the %s shared handle, hr %#lx.\n",
+                tests[i].type, hr);
+        if (FAILED(hr))
+            goto next;
+
+        sprintf(cmd, "%s d3d11 test_shared_resource_process_child %s %p", argv[0],
+                tests[i].type, handle);
+        memset(&startup, 0, sizeof(startup));
+        startup.cb = sizeof(startup);
+        memset(&info, 0, sizeof(info));
+        ok(CreateProcessA(NULL, cmd, NULL, NULL, tests[i].inherit_handle, 0, NULL, NULL,
+                &startup, &info), "CreateProcess failed, error %lu.\n", GetLastError());
+        if (info.hProcess)
+            wait_child_process(&info);
+
+        if (tests[i].inherit_handle)
+            ok(CloseHandle(handle), "Failed to close shared handle, error %lu.\n", GetLastError());
+
+next:
+        if (resource1)
+            IDXGIResource1_Release(resource1);
+        if (resource)
+            IDXGIResource_Release(resource);
+        if (texture)
+            ID3D11Texture2D_Release(texture);
+        winetest_pop_context();
+    }
+
+done:
+    if (device1)
+        ID3D11Device1_Release(device1);
+    if (device)
+        ID3D11Device_Release(device);
+}
+
 static void test_keyed_mutex(void)
 {
     IDXGIKeyedMutex *keyed_mutex, *keyed_mutex2;
@@ -37799,6 +37974,16 @@ START_TEST(d3d11)
         test_create_device_child();
         return;
     }
+    if (argc == 3 && !strcmp(argv[2], "test_shared_resource_process"))
+    {
+        test_shared_resource_process();
+        return;
+    }
+    if (argc == 5 && !strcmp(argv[2], "test_shared_resource_process_child"))
+    {
+        test_shared_resource_process_child();
+        return;
+    }
 
     if ((wined3d = GetModuleHandleA("wined3d.dll")))
     {
@@ -37989,6 +38174,7 @@ START_TEST(d3d11)
     queue_test(test_vertex_formats);
     queue_test(test_dxgi_resources);
     queue_for_each_feature_level(test_shared_resource);
+    queue_test(test_shared_resource_process);
     queue_test(test_keyed_mutex);
     queue_test(test_clear_during_render);
     queue_test(test_stencil_export);

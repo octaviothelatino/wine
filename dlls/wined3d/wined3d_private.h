@@ -2544,6 +2544,10 @@ struct wined3d_adapter_ops
     HRESULT (*adapter_create_texture)(struct wined3d_device *device, const struct wined3d_resource_desc *desc,
             unsigned int layer_count, unsigned int level_count, uint32_t flags, void *parent,
             const struct wined3d_parent_ops *parent_ops, struct wined3d_texture **texture);
+    HRESULT (*adapter_create_shared_texture)(struct wined3d_device *device, HANDLE shared_handle,
+            void *parent, const struct wined3d_parent_ops *parent_ops, struct wined3d_resource_desc *desc,
+            unsigned int *layer_count, unsigned int *level_count, struct wined3d_texture **texture);
+    HRESULT (*adapter_get_shared_handle)(struct wined3d_resource *resource, HANDLE *shared_handle);
     void (*adapter_destroy_texture)(struct wined3d_texture *texture);
     HRESULT (*adapter_create_rendertarget_view)(const struct wined3d_view_desc *desc,
             struct wined3d_resource *resource, void *parent, const struct wined3d_parent_ops *parent_ops,
@@ -3414,6 +3418,9 @@ struct wined3d_texture
 
     unsigned int row_pitch;
     unsigned int slice_pitch;
+
+    struct wined3d_shared_resource_desc shared_desc;
+    BOOL shared_desc_valid;
 
     struct wined3d_shader_resource_view *identity_srv;
 

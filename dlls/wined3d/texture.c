@@ -1884,6 +1884,35 @@ HRESULT CDECL wined3d_texture_create(struct wined3d_device *device, const struct
     return WINED3D_OK;
 }
 
+HRESULT CDECL wined3d_texture_create_shared(struct wined3d_device *device, HANDLE shared_handle,
+        void *parent, const struct wined3d_parent_ops *parent_ops, struct wined3d_resource_desc *desc,
+        unsigned int *layer_count, unsigned int *level_count, struct wined3d_texture **texture)
+{
+    TRACE("device %p, shared_handle %p, parent %p, parent_ops %p, desc %p, layer_count %p, "
+            "level_count %p, texture %p.\n", device, shared_handle, parent, parent_ops, desc,
+            layer_count, level_count, texture);
+
+    if (!device || !shared_handle || !desc || !layer_count || !level_count || !texture)
+        return E_INVALIDARG;
+    if (!device->adapter->adapter_ops->adapter_create_shared_texture)
+        return E_NOTIMPL;
+
+    return device->adapter->adapter_ops->adapter_create_shared_texture(device, shared_handle,
+            parent, parent_ops, desc, layer_count, level_count, texture);
+}
+
+void CDECL wined3d_texture_set_shared_desc(struct wined3d_texture *texture,
+        const struct wined3d_shared_resource_desc *desc)
+{
+    TRACE("texture %p, desc %p.\n", texture, desc);
+
+    if (!texture || !desc)
+        return;
+
+    texture->shared_desc = *desc;
+    texture->shared_desc_valid = TRUE;
+}
+
 HRESULT CDECL wined3d_texture_get_dc(struct wined3d_texture *texture, unsigned int sub_resource_idx, HDC *dc)
 {
     struct wined3d_device *device = texture->resource.device;

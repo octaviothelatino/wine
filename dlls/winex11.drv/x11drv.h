@@ -290,6 +290,11 @@ extern BOOL client_side_graphics;
 extern BOOL client_side_with_render;
 extern BOOL shape_layered_windows;
 extern const struct gdi_dc_funcs *X11DRV_XRender_Init(void);
+extern BOOL X11DRV_XRender_CopyAlpha( Pixmap source, Window destination, const RECT *rect,
+                                     const RECT *dirty, HRGN clip );
+extern void X11DRV_XRender_PrepareChildren( Window parent, void **state );
+extern void X11DRV_XRender_CompositeChildren( Window parent, Drawable destination, void *state, HRGN clip );
+extern void X11DRV_XRender_ReleaseChildren( void **state );
 
 extern BOOL visual_from_pixel_format( int format, XVisualInfo *visual );
 
@@ -374,6 +379,10 @@ struct x11drv_client_surface
 
     HDC hdc_src;
     HDC hdc_dst;
+    void *composited_children;
+    Pixmap composition_pixmap;
+    GC composition_gc;
+    unsigned int composition_width, composition_height;
 };
 
 extern struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client );
@@ -693,6 +702,7 @@ struct x11drv_win_data
     UINT        is_fullscreen : 1; /* is the window visible rect fullscreen */
     UINT        is_offscreen : 1; /* has been moved offscreen by the window manager */
     UINT        parent_invalid : 1; /* is the parent host window possibly invalid */
+    UINT        preserved_child : 1; /* whole_window was kept when changing to a child */
     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
     Window      embedder;       /* window id of embedder */

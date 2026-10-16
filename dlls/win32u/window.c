@@ -2243,7 +2243,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
 
     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
-    else if (is_child) needs_surface = FALSE;
+    else if (is_child && !(ex_style & WS_EX_LAYERED)) needs_surface = FALSE;
     else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
     else needs_surface = !!(style & WS_VISIBLE);
@@ -2709,10 +2709,16 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
     SIZE offset;
     BOOL ret = FALSE;
 
+    TRACE("UpdateLayeredWindow hwnd %p style %#x exstyle %#x flags %#x size %ldx%ld source %p.\n",
+            hwnd, get_window_long(hwnd, GWL_STYLE), get_window_long(hwnd, GWL_EXSTYLE), flags,
+            (long)(size ? size->cx : 0), (long)(size ? size->cy : 0), hdc_src);
+
     if (flags & ~(ULW_COLORKEY | ULW_ALPHA | ULW_OPAQUE | ULW_EX_NORESIZE) ||
         !(get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED) ||
         NtUserGetLayeredWindowAttributes( hwnd, NULL, NULL, NULL ))
     {
+        WARN("Rejecting UpdateLayeredWindow hwnd %p exstyle %#x flags %#x.\n", hwnd,
+                get_window_long(hwnd, GWL_EXSTYLE), flags);
         RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
         return FALSE;
     }
@@ -2755,7 +2761,11 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
 
     surface = get_window_surface( hwnd, swp_flags, TRUE, &new_rects, &surface_rect );
     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
-    if (!surface) return FALSE;
+    if (!surface)
+    {
+        WARN("No window surface for layered window %p, rect %s.\n", hwnd, wine_dbgstr_rect(&surface_rect));
+        return FALSE;
+    }
 
     if (!hdc_src || surface == &dummy_surface || NtUserWindowFromDC( hdc_src ) == hwnd)
     {
@@ -2785,6 +2795,8 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         ret = NtGdiAlphaBlend( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
                                hdc_src, src_rect.left, src_rect.top, src_rect.right - src_rect.left, src_rect.bottom - src_rect.top,
                                *(DWORD *)&src_blend, 0 );
+        TRACE("Layered window %p alpha blend source %p target %p rect %s source_rect %s ret %d error %u.\n",
+                hwnd, hdc_src, hdc, wine_dbgstr_rect(&rect), wine_dbgstr_rect(&src_rect), ret, GetLastError());
         if (ret) add_bounds_rect( &surface->bounds, &rect );
 
         NtGdiDeleteObjectApp( hdc );

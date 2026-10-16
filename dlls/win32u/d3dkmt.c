@@ -29,117 +29,9 @@
 #include "ntgdi_private.h"
 #include "win32u_private.h"
 #include "ntuser_private.h"
-
-#include <d3d9types.h>
-#include <dxgi.h>
-#include <d3d10.h>
-#include <d3d11.h>
-#include <d3d12.h>
+#include "wine/d3dkmt.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3dkmt);
-
-/* D3DKMT runtime descriptors */
-
-struct d3dkmt_dxgi_desc
-{
-    UINT                        size;
-    UINT                        version;
-    UINT                        width;
-    UINT                        height;
-    DXGI_FORMAT                 format;
-    UINT                        unknown_0;
-    UINT                        unknown_1;
-    UINT                        keyed_mutex;
-    D3DKMT_HANDLE               mutex_handle;
-    D3DKMT_HANDLE               sync_handle;
-    UINT                        nt_shared;
-    UINT                        unknown_2;
-    UINT                        unknown_3;
-    UINT                        unknown_4;
-};
-
-struct d3dkmt_d3d9_desc
-{
-    struct d3dkmt_dxgi_desc     dxgi;
-    D3DFORMAT                   format;
-    D3DRESOURCETYPE             type;
-    UINT                        usage;
-    union
-    {
-        struct
-        {
-            UINT                unknown_0;
-            UINT                width;
-            UINT                height;
-            UINT                levels;
-            UINT                depth;
-        } texture;
-        struct
-        {
-            UINT                unknown_0;
-            UINT                unknown_1;
-            UINT                unknown_2;
-            UINT                width;
-            UINT                height;
-        } surface;
-        struct
-        {
-            UINT                unknown_0;
-            UINT                width;
-            UINT                format;
-            UINT                unknown_1;
-            UINT                unknown_2;
-        } buffer;
-    };
-};
-
-C_ASSERT( sizeof(struct d3dkmt_d3d9_desc) == 0x58 );
-
-struct d3dkmt_d3d11_desc
-{
-    struct d3dkmt_dxgi_desc     dxgi;
-    D3D11_RESOURCE_DIMENSION    dimension;
-    union
-    {
-        D3D10_BUFFER_DESC       d3d10_buf;
-        D3D10_TEXTURE1D_DESC    d3d10_1d;
-        D3D10_TEXTURE2D_DESC    d3d10_2d;
-        D3D10_TEXTURE3D_DESC    d3d10_3d;
-        D3D11_BUFFER_DESC       d3d11_buf;
-        D3D11_TEXTURE1D_DESC    d3d11_1d;
-        D3D11_TEXTURE2D_DESC    d3d11_2d;
-        D3D11_TEXTURE3D_DESC    d3d11_3d;
-    };
-};
-
-C_ASSERT( sizeof(struct d3dkmt_d3d11_desc) == 0x68 );
-
-struct d3dkmt_d3d12_desc
-{
-    struct d3dkmt_d3d11_desc    d3d11;
-    UINT                        unknown_5[4];
-    UINT                        resource_size;
-    UINT                        unknown_6[7];
-    UINT                        resource_align;
-    UINT                        unknown_7[9];
-    union
-    {
-        D3D12_RESOURCE_DESC     desc;
-        D3D12_RESOURCE_DESC1    desc1;
-    };
-    UINT64                      unknown_8[1];
-};
-
-C_ASSERT( sizeof(struct d3dkmt_d3d12_desc) == 0x108 );
-C_ASSERT( offsetof(struct d3dkmt_d3d12_desc, unknown_5) == sizeof(struct d3dkmt_d3d11_desc) );
-
-union d3dkmt_desc
-{
-    struct d3dkmt_dxgi_desc     dxgi;
-    struct d3dkmt_d3d9_desc     d3d9;
-    struct d3dkmt_d3d11_desc    d3d11;
-    struct d3dkmt_d3d12_desc    d3d12;
-};
 
 struct d3dkmt_object
 {
@@ -336,6 +228,25 @@ static NTSTATUS d3dkmt_object_update( struct d3dkmt_object *object, const void *
 
     if (status) WARN( "Failed to update object %#x/%p global %#x, status %#x\n", object->local, object, object->global, status );
     else TRACE( "Updated object %#x/%p global %#x\n", object->local, object, object->global );
+    return status;
+}
+
+static NTSTATUS d3dkmt_object_update_global( enum d3dkmt_type type, D3DKMT_HANDLE global,
+                                             const void *runtime, UINT runtime_size )
+{
+    NTSTATUS status;
+
+    SERVER_START_REQ( d3dkmt_object_update )
+    {
+        req->type = type;
+        req->global = global;
+        if (runtime_size) wine_server_add_data( req, runtime, runtime_size );
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+
+    if (status) WARN( "Failed to update global object %#x, status %#x\n", global, status );
+    else TRACE( "Updated global object %#x\n", global );
     return status;
 }
 
@@ -548,6 +459,16 @@ static struct d3dkmt_resource *get_d3dkmt_resource( D3DKMT_HANDLE handle )
     return CONTAINING_RECORD( obj, struct d3dkmt_resource, obj );
 }
 
+static NTSTATUS d3dkmt_resource_get_runtime( D3DKMT_HANDLE global, void *runtime, UINT *runtime_size )
+{
+    struct d3dkmt_resource *resource;
+    NTSTATUS status;
+
+    if ((status = d3dkmt_resource_open( global, NULL, runtime, runtime_size, &resource ))) return status;
+    d3dkmt_resource_free( resource );
+    return STATUS_SUCCESS;
+}
+
 static void d3dkmt_sync_free( struct d3dkmt_object *sync )
 {
     if (sync) d3dkmt_object_free( sync );
@@ -653,8 +574,27 @@ NTSTATUS WINAPI NtGdiDdDDIEscape( const D3DKMT_ESCAPE *desc )
         TRACE( "D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE hContext %#x, pPrivateDriverData %p, PrivateDriverDataSize %#x\n",
                desc->hContext, desc->pPrivateDriverData, desc->PrivateDriverDataSize );
 
-        if (!(resource = get_d3dkmt_resource( desc->hContext ))) return STATUS_INVALID_PARAMETER;
-        return d3dkmt_object_update( &resource->obj, desc->pPrivateDriverData, desc->PrivateDriverDataSize );
+        if ((resource = get_d3dkmt_resource( desc->hContext )))
+            return d3dkmt_object_update( &resource->obj, desc->pPrivateDriverData, desc->PrivateDriverDataSize );
+        if (is_d3dkmt_global( desc->hContext ))
+            return d3dkmt_object_update_global( D3DKMT_RESOURCE, desc->hContext,
+                    desc->pPrivateDriverData, desc->PrivateDriverDataSize );
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    case D3DKMT_ESCAPE_QUERY_RESOURCE_WINE:
+    {
+        UINT runtime_size;
+
+        TRACE( "D3DKMT_ESCAPE_QUERY_RESOURCE_WINE hContext %#x, pPrivateDriverData %p, PrivateDriverDataSize %#x\n",
+               desc->hContext, desc->pPrivateDriverData, desc->PrivateDriverDataSize );
+
+        if (!is_d3dkmt_global( desc->hContext )) return STATUS_INVALID_PARAMETER;
+        if (d3dkmt_object_query( D3DKMT_RESOURCE, desc->hContext, NULL, &runtime_size ))
+            return STATUS_INVALID_PARAMETER;
+        if (runtime_size > desc->PrivateDriverDataSize || (runtime_size && !desc->pPrivateDriverData))
+            return STATUS_BUFFER_TOO_SMALL;
+        return d3dkmt_resource_get_runtime( desc->hContext, desc->pPrivateDriverData, &runtime_size );
     }
 
     case D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE:

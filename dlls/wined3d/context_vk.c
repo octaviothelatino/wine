@@ -623,19 +623,34 @@ BOOL wined3d_context_vk_create_bo(struct wined3d_context_vk *context_vk, VkDevic
     return TRUE;
 }
 
-bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
-        const VkImageCreateInfo *desc, struct wined3d_image_vk *image)
+static bool wined3d_context_vk_create_image_internal(struct wined3d_context_vk *context_vk,
+        const VkImageCreateInfo *desc, bool shared, HANDLE shared_handle, struct wined3d_image_vk *image)
 {
     struct wined3d_adapter_vk *adapter_vk = wined3d_adapter_vk(context_vk->c.device->adapter);
     struct wined3d_device_vk *device_vk = wined3d_device_vk(context_vk->c.device);
     const struct wined3d_vk_info *vk_info = context_vk->vk_info;
     VkMemoryRequirements memory_requirements;
+    VkExternalMemoryImageCreateInfo external_info;
+    VkExportMemoryAllocateInfo export_info;
+    VkImportMemoryWin32HandleInfoKHR import_info;
+    VkMemoryAllocateInfo allocate_info;
+    VkImageCreateInfo create_info = *desc;
     unsigned int memory_type_idx;
     VkResult vr;
 
-    image->command_buffer_id = 0;
+    if (shared)
+    {
+        external_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        external_info.pNext = create_info.pNext;
+        external_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+        create_info.pNext = &external_info;
+    }
 
-    vr = VK_CALL(vkCreateImage(device_vk->vk_device, desc, NULL, &image->vk_image));
+    image->command_buffer_id = 0;
+    image->memory = NULL;
+    image->vk_memory = VK_NULL_HANDLE;
+
+    vr = VK_CALL(vkCreateImage(device_vk->vk_device, &create_info, NULL, &image->vk_image));
     if (vr != VK_SUCCESS)
     {
         ERR("Failed to create image, vr %s.\n", wined3d_debug_vkresult(vr));
@@ -656,8 +671,39 @@ bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
         return false;
     }
 
-    image->memory = wined3d_context_vk_allocate_memory(context_vk, memory_type_idx,
-            memory_requirements.size, &image->vk_memory);
+    if (shared)
+    {
+        if (shared_handle)
+        {
+            import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
+            import_info.pNext = NULL;
+            import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+            import_info.handle = shared_handle;
+
+            allocate_info.pNext = &import_info;
+        }
+        else
+        {
+            export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+            export_info.pNext = NULL;
+            export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+
+            allocate_info.pNext = &export_info;
+        }
+
+        allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocate_info.allocationSize = memory_requirements.size;
+        allocate_info.memoryTypeIndex = memory_type_idx;
+
+        vr = VK_CALL(vkAllocateMemory)(device_vk->vk_device, &allocate_info, NULL, &image->vk_memory);
+        if (vr != VK_SUCCESS)
+            image->vk_memory = VK_NULL_HANDLE;
+    }
+    else
+    {
+        image->memory = wined3d_context_vk_allocate_memory(context_vk, memory_type_idx,
+                memory_requirements.size, &image->vk_memory);
+    }
     if (!image->vk_memory)
     {
         ERR("Failed to allocate image memory.\n");
@@ -683,6 +729,24 @@ bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
     }
 
     return true;
+}
+
+bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
+        const VkImageCreateInfo *desc, struct wined3d_image_vk *image)
+{
+    return wined3d_context_vk_create_image_internal(context_vk, desc, false, NULL, image);
+}
+
+bool wined3d_context_vk_create_shared_image(struct wined3d_context_vk *context_vk,
+        const VkImageCreateInfo *desc, struct wined3d_image_vk *image)
+{
+    return wined3d_context_vk_create_image_internal(context_vk, desc, true, NULL, image);
+}
+
+bool wined3d_context_vk_create_imported_image(struct wined3d_context_vk *context_vk,
+        const VkImageCreateInfo *desc, HANDLE shared_handle, struct wined3d_image_vk *image)
+{
+    return wined3d_context_vk_create_image_internal(context_vk, desc, true, shared_handle, image);
 }
 
 static struct wined3d_retired_object_vk *wined3d_context_vk_get_retired_object_vk(struct wined3d_context_vk *context_vk)

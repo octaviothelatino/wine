@@ -984,11 +984,22 @@ static BOOL X11DRV_ConfigureNotify( HWND hwnd, XEvent *xev )
         host_window_configure_child( data->parent, data->whole_window, rect, event->send_event );
     }
 
-    /* synthetic events are already in absolute coordinates */
-    if (!event->send_event) pos = host_window_map_point( data->parent, event->x, event->y );
-    else if (is_virtual_desktop()) FIXME( "synthetic event mapping not implemented\n" );
+    /* Preserved whole windows are X11 children of the Win32 top-level host.
+     * Their configure coordinates are relative to that parent, just like the
+     * Win32 rectangles used by the preserved-child path. */
+    if (data->preserved_child)
+    {
+        pos.x = event->x;
+        pos.y = event->y;
+    }
+    else
+    {
+        /* synthetic events are already in absolute coordinates */
+        if (!event->send_event) pos = host_window_map_point( data->parent, event->x, event->y );
+        else if (is_virtual_desktop()) FIXME( "synthetic event mapping not implemented\n" );
 
-    pos = root_to_virtual_screen( pos.x, pos.y );
+        pos = root_to_virtual_screen( pos.x, pos.y );
+    }
     if (size.cx == 1 && size.cy == 1 && IsRectEmpty( &data->rects.window )) size.cx = size.cy = 0;
     SetRect( &rect, pos.x, pos.y, pos.x + size.cx, pos.y + size.cy );
     window_configure_notify( data, event->serial, &rect );

@@ -390,10 +390,46 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
 static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
 {
-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
+    IWineDXGISwapChainFactory *swapchain_factory;
+    HRESULT hr;
+
+    TRACE("iface %p, device %p, desc %p, output %p, swapchain %p.\n",
             iface, device, desc, output, swapchain);
 
-    return E_NOTIMPL;
+    if (!device || !desc || !swapchain)
+    {
+        WARN("Invalid pointer.\n");
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (desc->Stereo)
+    {
+        FIXME("Stereo swapchains are not supported.\n");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    if (!desc->Width || !desc->Height
+            || desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+            || desc->Scaling != DXGI_SCALING_STRETCH)
+        return DXGI_ERROR_INVALID_CALL;
+
+    if (!dxgi_validate_swapchain_desc(desc))
+        return DXGI_ERROR_INVALID_CALL;
+
+    if (output)
+        FIXME("Ignoring output %p.\n", output);
+
+    if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_IWineDXGISwapChainFactory,
+            (void **)&swapchain_factory)))
+    {
+        hr = IWineDXGISwapChainFactory_create_swapchain(swapchain_factory,
+                (IDXGIFactory *)iface, NULL, desc, NULL, output, swapchain);
+        IWineDXGISwapChainFactory_Release(swapchain_factory);
+        return hr;
+    }
+
+    ERR("This is not the device we're looking for.\n");
+    return DXGI_ERROR_UNSUPPORTED;
 }
 
 static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)

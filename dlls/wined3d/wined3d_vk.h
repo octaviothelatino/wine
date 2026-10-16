@@ -161,6 +161,7 @@ struct wined3d_device_vk;
     VK_DEVICE_PFN(vkGetEventStatus) \
     VK_DEVICE_PFN(vkGetFenceStatus) \
     VK_DEVICE_PFN(vkGetImageMemoryRequirements) \
+    VK_DEVICE_EXT_PFN(vkGetMemoryWin32HandleKHR) \
     VK_DEVICE_PFN(vkGetImageSparseMemoryRequirements) \
     VK_DEVICE_PFN(vkGetImageSubresourceLayout) \
     VK_DEVICE_PFN(vkGetPipelineCacheData) \
@@ -774,6 +775,10 @@ BOOL wined3d_context_vk_create_bo(struct wined3d_context_vk *context_vk, VkDevic
         VkBufferUsageFlags usage, VkMemoryPropertyFlags memory_type, struct wined3d_bo_vk *bo);
 bool wined3d_context_vk_create_image(struct wined3d_context_vk *context_vk,
         const VkImageCreateInfo *desc, struct wined3d_image_vk *image);
+bool wined3d_context_vk_create_shared_image(struct wined3d_context_vk *context_vk,
+        const VkImageCreateInfo *desc, struct wined3d_image_vk *image);
+bool wined3d_context_vk_create_imported_image(struct wined3d_context_vk *context_vk,
+        const VkImageCreateInfo *desc, HANDLE shared_handle, struct wined3d_image_vk *image);
 void wined3d_context_vk_destroy_allocator_block(struct wined3d_context_vk *context_vk,
         struct wined3d_allocator_block *block, uint64_t command_buffer_id);
 void wined3d_context_vk_destroy_bo(struct wined3d_context_vk *context_vk,
@@ -988,6 +993,10 @@ struct wined3d_texture_vk
     struct wined3d_image_vk image;
     enum VkImageLayout layout;
     uint32_t bind_mask;
+    BOOL shared;
+    BOOL shared_import;
+    HANDLE shared_handle;
+    D3DKMT_HANDLE shared_global;
 
     VkDescriptorImageInfo default_image_info;
 };
