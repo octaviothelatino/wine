@@ -66,6 +66,15 @@ static D3D_FEATURE_LEVEL d3d_feature_level_from_wined3d(enum wined3d_feature_lev
     return (D3D_FEATURE_LEVEL)level;
 }
 
+static struct wined3d_adapter *d3d_device_get_adapter(struct d3d_device *device)
+{
+    struct wined3d *wined3d = wined3d_device_get_wined3d(device->wined3d_device);
+    struct wined3d_device_creation_parameters params;
+
+    wined3d_device_get_creation_parameters(device->wined3d_device, &params);
+    return wined3d_get_adapter(wined3d, params.adapter_idx);
+}
+
 /* ID3DDeviceContextState methods */
 
 static inline struct d3d_device_context_state *impl_from_ID3DDeviceContextState(ID3DDeviceContextState *iface)
@@ -2782,12 +2791,29 @@ static void STDMETHODCALLTYPE d3d11_device_context_UpdateSubresource1(ID3D11Devi
 static void STDMETHODCALLTYPE d3d11_device_context_DiscardResource(ID3D11DeviceContext4 *iface,
         ID3D11Resource *resource)
 {
-    FIXME("iface %p, resource %p stub!\n", iface, resource);
+    struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
+    struct wined3d_resource *wined3d_resource;
+
+    TRACE("iface %p, resource %p.\n", iface, resource);
+
+    wined3d_resource = wined3d_resource_from_d3d11_resource(resource);
+    wined3d_device_context_discard_resource(context->wined3d_context, wined3d_resource, NULL);
 }
 
 static void STDMETHODCALLTYPE d3d11_device_context_DiscardView(ID3D11DeviceContext4 *iface, ID3D11View *view)
 {
-    FIXME("iface %p, view %p stub!\n", iface, view);
+    struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
+    struct wined3d_resource *wined3d_resource;
+    struct wined3d_view_desc desc;
+    ID3D11Resource *resource;
+
+    TRACE("iface %p, view %p.\n", iface, view);
+
+    ID3D11View_GetResource(view, &resource);
+    wined3d_resource = wined3d_resource_from_d3d11_resource(resource);
+    wined3d_view_desc_from_d3d11_view(view, &desc);
+    wined3d_device_context_discard_resource(context->wined3d_context, wined3d_resource, &desc);
+    ID3D11Resource_Release(resource);
 }
 
 static void STDMETHODCALLTYPE d3d11_device_context_VSSetConstantBuffers1(ID3D11DeviceContext4 *iface,
@@ -4627,7 +4653,7 @@ static HRESULT d3d11_device_open_shared_resource(struct d3d_device *device, HAND
         return E_INVALIDARG;
     }
 
-    TRACE("Shared resource %#x: keyed_mutex %u, mutex_handle %#x, sync_handle %#x, nt_shared %u.\n",
+    TRACE("Shared resource %p: keyed_mutex %u, mutex_handle %#x, sync_handle %#x, nt_shared %u.\n",
             resource, runtime_desc.dxgi.keyed_mutex, runtime_desc.dxgi.mutex_handle,
             runtime_desc.dxgi.sync_handle, runtime_desc.dxgi.nt_shared);
 
@@ -4639,7 +4665,7 @@ static HRESULT d3d11_device_open_shared_resource(struct d3d_device *device, HAND
     wined3d_desc.format = wined3dformat_from_dxgi_format(desc.Format);
     wined3d_desc.multisample_type = desc.SampleDesc.Count > 1 ? desc.SampleDesc.Count : WINED3D_MULTISAMPLE_NONE;
     wined3d_desc.multisample_quality = desc.SampleDesc.Quality;
-    wined3d_desc.usage = wined3d_usage_from_d3d11(desc.Usage);
+    wined3d_desc.usage = wined3d_usage_from_d3d11(desc.Usage, desc.MiscFlags);
     wined3d_desc.bind_flags = wined3d_bind_flags_from_d3d11(desc.BindFlags, desc.MiscFlags);
     wined3d_desc.access = wined3d_access_from_d3d11(desc.Usage,
             desc.Usage == D3D11_USAGE_DEFAULT ? 0 : desc.CPUAccessFlags);
@@ -7926,7 +7952,7 @@ static UINT STDMETHODCALLTYPE d3d11_video_device_GetVideoDecoderProfileCount(ID3
 
     TRACE("iface %p.\n", iface);
 
-    return wined3d_device_get_video_decode_profile_count(device->wined3d_device);
+    return wined3d_adapter_get_decode_profile_count(d3d_device_get_adapter(device));
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_video_device_GetVideoDecoderProfile(
@@ -7936,7 +7962,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_video_device_GetVideoDecoderProfile(
 
     TRACE("iface %p, index %u, profile %p.\n", iface, index, profile);
 
-    return wined3d_device_get_video_decode_profile(device->wined3d_device, index, profile);
+    return wined3d_adapter_get_decode_profile(d3d_device_get_adapter(device), index, profile);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_video_device_CheckVideoDecoderFormat(

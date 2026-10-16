@@ -462,6 +462,7 @@ enum wined3d_decoder_backend
     WINED3D_DECODER_BACKEND_AUTO,
     WINED3D_DECODER_BACKEND_VULKAN,
     WINED3D_DECODER_BACKEND_VA,
+    WINED3D_DECODER_BACKEND_NONE,
 };
 
 #define WINED3D_CSMT_ENABLE    0x00000001
@@ -2329,6 +2330,7 @@ enum wined3d_pci_device
     CARD_NVIDIA_TESLA_T4            = 0x1eb8,
     CARD_NVIDIA_AMPERE_A10          = 0x2236,
     CARD_NVIDIA_AMPERE_A10G         = 0x2237,
+    CARD_NVIDIA_L4                  = 0x27b8,
     CARD_NVIDIA_GEFORCE_RTX4060     = 0x2882,
     CARD_NVIDIA_GEFORCE_RTX4060M    = 0x28a0,
     CARD_NVIDIA_GEFORCE_RTX4060TI8G = 0x2803,
@@ -2620,7 +2622,7 @@ struct wined3d_adapter
     void *formats;
     size_t format_size;
 
-    ssize_t mapped_size;
+    SSIZE_T mapped_size;
 
     const struct wined3d_vertex_pipe_ops *vertex_pipe;
     const struct wined3d_fragment_pipe_ops *fragment_pipe;
@@ -2642,7 +2644,7 @@ struct wined3d_adapter *wined3d_adapter_gl_create(unsigned int ordinal,
         unsigned int wined3d_creation_flags);
 
 BOOL wined3d_adapter_no3d_init_format_info(struct wined3d_adapter *adapter);
-ssize_t adapter_adjust_mapped_memory(struct wined3d_adapter *adapter, ssize_t size);
+SSIZE_T adapter_adjust_mapped_memory(struct wined3d_adapter *adapter, SSIZE_T size);
 UINT64 adapter_adjust_memory(struct wined3d_adapter *adapter, INT64 amount);
 
 #define ARG_UNUSED          0xff
@@ -3397,7 +3399,6 @@ struct wined3d_texture_ops
 #define WINED3D_TEXTURE_DC_IN_USE           0x00001000
 #define WINED3D_TEXTURE_DISCARD             0x00002000
 #define WINED3D_TEXTURE_GET_DC              0x00004000
-#define WINED3D_TEXTURE_GENERATE_MIPMAPS    0x00008000
 #define WINED3D_TEXTURE_DOWNLOADABLE        0x00010000
 
 #define WINED3D_TEXTURE_ASYNC_COLOR_KEY     0x00000001
@@ -3671,8 +3672,9 @@ C_ASSERT(!(WINED3D_CS_QUEUE_SIZE & (WINED3D_CS_QUEUE_SIZE - 1)));
 
 struct wined3d_cs_queue
 {
-    ULONG head, tail;
-    BYTE data[WINED3D_CS_QUEUE_SIZE];
+    DECLSPEC_ALIGN(64) ULONG head;
+    DECLSPEC_ALIGN(64) ULONG tail;
+    DECLSPEC_ALIGN(64) BYTE data[WINED3D_CS_QUEUE_SIZE];
 };
 
 struct wined3d_device_context_ops

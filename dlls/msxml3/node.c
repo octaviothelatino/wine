@@ -46,6 +46,8 @@
 #include "msxml6.h"
 #include <activscp.h>
 #include "objsafe.h"
+#include "mshtml.h"
+#include "asptlb.h"
 
 #include "msxml_private.h"
 #include "saxreader_extensions.h"
@@ -366,6 +368,19 @@ struct domnode * domnode_get_root_element(struct domnode *doc)
     LIST_FOR_EACH_ENTRY(node, &doc->children, struct domnode, entry)
     {
         if (node->type == NODE_ELEMENT)
+            return node;
+    }
+
+    return NULL;
+}
+
+struct domnode * domnode_get_dtd(struct domnode *doc)
+{
+    struct domnode *node;
+
+    LIST_FOR_EACH_ENTRY(node, &doc->children, struct domnode, entry)
+    {
+        if (node->type == NODE_DOCUMENT_TYPE)
             return node;
     }
 
@@ -3276,6 +3291,52 @@ HRESULT node_transform_node(struct domnode *node, IXMLDOMNode *stylesheet, BSTR 
     return node_transform_node_params(node, stylesheet, p, NULL, NULL);
 }
 
+HRESULT node_transform_node_to_object(struct domnode *node, IXMLDOMNode *stylesheet, const VARIANT *output)
+{
+    IUnknown *unk;
+
+    switch (V_VT(output))
+    {
+        case VT_UNKNOWN:
+        case VT_DISPATCH:
+        {
+            ISequentialStream *stream;
+            HRESULT hr;
+
+            if (!V_UNKNOWN(output))
+                return E_INVALIDARG;
+
+            if (IUnknown_QueryInterface(V_UNKNOWN(output), &IID_IHTMLObjectElement, (void **)&unk) == S_OK)
+            {
+                FIXME("Output to IHTMLObjectElement is not supported.\n");
+                IUnknown_Release(unk);
+                return E_NOTIMPL;
+            }
+
+            if (IUnknown_QueryInterface(V_UNKNOWN(output), &IID_IStream, (void **)&stream) == S_OK
+                    || IUnknown_QueryInterface(V_UNKNOWN(output), &IID_ISequentialStream, (void **)&stream) == S_OK)
+            {
+                hr = node_transform_node_params(node, stylesheet, NULL, stream, NULL);
+                ISequentialStream_Release(stream);
+                return hr;
+            }
+
+            if (IUnknown_QueryInterface(V_UNKNOWN(output), &IID_IResponse, (void **)&unk) == S_OK)
+            {
+                FIXME("Output to IResponse is not supported.\n");
+                return E_NOTIMPL;
+            }
+
+            WARN("Unsupported destination type.\n");
+            return E_INVALIDARG;
+        }
+        default:
+            FIXME("Output %s not handled.\n", debugstr_variant(output));
+    }
+
+    return E_NOTIMPL;
+}
+
 HRESULT node_select_nodes(struct domnode *node, BSTR query, IXMLDOMNodeList **list)
 {
     struct domnode *doc = node_get_doc(node);
@@ -4815,32 +4876,177 @@ static void LIBXML2_LOG_CALLBACK validate_warning(void* ctx, char const* msg, ..
     va_end(ap);
 }
 
+static HRESULT return_validation_error(LONG code, IXMLDOMParseError **err)
+{
+    HRESULT hr;
+
+    if (err)
+    {
+        if (FAILED(hr = create_parse_error(code, NULL, err)))
+            return hr;
+    }
+
+    return S_FALSE;
+}
+
+static bool node_validate_root(struct validation_context *ctxt, struct domnode *node)
+{
+    struct domnode *dtd, *root;
+
+    if (node->type != NODE_DOCUMENT)
+        return true;
+
+    /* Check for root element presence. Tree manipulation should ensure that there is only
+       one top level element. */
+
+    if (!(root = domnode_get_root_element(node)))
+    {
+        ctxt->code = E_XML_NOTWF;
+        return false;
+    }
+
+    if ((dtd = domnode_get_dtd(node)))
+    {
+        if (wcscmp(dtd->qname, root->qname))
+        {
+            ctxt->code = E_DOM_ROOT_NAME_MISMATCH;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool node_dtd_validate_attribute(struct validation_context *ctxt, struct dtd *dtd, struct domnode *attr)
+{
+    struct domnode *elem = attr->parent;
+    struct attlist_attr *decl;
+
+    /* Detached attribute node */
+    if (!elem)
+        return true;
+
+    if (!(decl = parser_dtd_get_attr_decl(dtd, attr)))
+    {
+        ctxt->code = E_DOM_ATTRIBUTE_NOT_DEFINED;
+        return false;
+    }
+
+    return parser_dtd_validate_attribute_value(ctxt, dtd, decl, attr);
+}
+
+static bool node_dtd_validate_single_node(struct validation_context *ctxt, struct dtd *dtd, struct domnode *node)
+{
+    struct element_decl *elem_decl;
+
+    if (node->type == NODE_ATTRIBUTE)
+        return node_dtd_validate_attribute(ctxt, dtd, node);
+
+    if (node->type != NODE_ELEMENT)
+        return true;
+
+    if (!(elem_decl = parser_dtd_get_element_decl(dtd, node->qname)))
+    {
+        ctxt->code = E_DOM_ELEMENT_UNDECLARED;
+        return false;
+    }
+
+    return parser_dtd_validate_element_content(ctxt, dtd, elem_decl, node);
+}
+
+static bool node_dtd_validate_node(struct validation_context *ctxt, struct dtd *dtd, struct domnode *node)
+{
+    struct domnode *attr, *root, *child;
+    bool ret = true;
+
+    root = node;
+    while (ret)
+    {
+        ret &= node_dtd_validate_single_node(ctxt, dtd, node);
+
+        if (node->type == NODE_ELEMENT)
+        {
+            attr = domnode_get_first_attribute(node);
+
+            while (attr && ret)
+            {
+                ret &= node_dtd_validate_attribute(ctxt, dtd, attr);
+                attr = domnode_get_next_attribute_sibling(attr);
+            }
+
+            if ((child = domnode_get_first_child(node)))
+            {
+                node = child;
+                continue;
+            }
+        }
+
+        for (;;)
+        {
+            if (node == root)
+                return ret;
+            if (domnode_get_next_sibling(node))
+                break;
+            node = node->parent;
+        }
+
+        node = domnode_get_next_sibling(node);
+    }
+
+    return ret;
+}
+
 HRESULT node_validate(struct domnode *doc, IXMLDOMNode *node_obj, IXMLDOMParseError **err)
 {
+    struct validation_context ctxt = { 0 };
+    struct domnode *node, *root, *dtd;
     IXMLDOMSchemaCollection2 *schema;
-    struct domnode *node;
     LONG err_code = 0;
     HRESULT hr = S_OK;
     int validated = 0;
     xmlDocPtr xmldoc;
     xmlNodePtr xmlnode;
 
-    if (!(node = get_node_obj(node_obj)))
-        return E_FAIL;
-
-    if (node->owner != doc && node != doc)
+    if (node_obj)
     {
-        if (err)
-            *err = create_parseError(err_code, NULL, NULL, NULL, 0, 0, 0);
-        return E_FAIL;
+        if (!(node = get_node_obj(node_obj)))
+            return E_FAIL;
+
+        if (node->owner != doc && node != doc)
+        {
+            return_validation_error(err_code, err);
+            return E_FAIL;
+        }
+
+        switch (node->type)
+        {
+            case NODE_DOCUMENT:
+            case NODE_DOCUMENT_TYPE:
+                return return_validation_error(E_DOM_INVALIDTYPE, err);
+            default:
+                ;
+        }
+    }
+    else
+    {
+        node = doc;
     }
 
-    /* TODO: for now simply treat empty document as not well-formed */
-    if (list_empty(&node->children))
+    if (node->type == NODE_DOCUMENT)
     {
-        if (err)
-            *err = create_parseError(E_XML_NOTWF, NULL, NULL, NULL, 0, 0, 0);
-        return S_FALSE;
+        if (!node_validate_root(&ctxt, node))
+            return return_validation_error(ctxt.code, err);
+    }
+
+    if ((dtd = domnode_get_dtd(node_get_doc(node))))
+    {
+        if (node->type == NODE_DOCUMENT)
+            root = domnode_get_root_element(node);
+        else
+            root = node;
+
+        if (!node_dtd_validate_node(&ctxt, dtd->dtd, root))
+            return return_validation_error(ctxt.code, err);
     }
 
     xmldoc = create_xmldoc_from_domdoc(node, &xmlnode);
@@ -4855,7 +5061,7 @@ HRESULT node_validate(struct domnode *doc, IXMLDOMNode *node_obj, IXMLDOMParseEr
         vctx->warning = validate_warning;
         ++validated;
 
-        ret = node == doc ? xmlValidateDocument(vctx, xmldoc) : xmlValidateElement(vctx, xmldoc, xmlnode);
+        ret = node->type == NODE_DOCUMENT ? xmlValidateDocument(vctx, xmldoc) : xmlValidateElement(vctx, xmldoc, xmlnode);
         if (!ret)
         {
             /* TODO: get a real error code here */
@@ -4901,8 +5107,7 @@ HRESULT node_validate(struct domnode *doc, IXMLDOMNode *node_obj, IXMLDOMParseEr
         hr = S_FALSE;
     }
 
-    if (err)
-        *err = create_parseError(err_code, NULL, NULL, NULL, 0, 0, 0);
+    return_validation_error(err_code, err);
 
     return hr;
 }

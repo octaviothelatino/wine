@@ -396,6 +396,18 @@ static void set_window_monitor_dpi( struct window *win )
     SHARED_WRITE_END;
 }
 
+/* attach or detach the parent window thread input if necessary */
+static void attach_parent_thread( struct window *win, bool attach )
+{
+    struct thread *thread = win->thread, *parent;
+
+    if (is_toplevel( win ) || !(parent = win->parent->thread) || parent == thread) return;
+
+    /* if parent belongs to a different thread and the window isn't top-level, attach / detach the two threads */
+    if (attach) attach_thread_input( thread->queue, parent->queue );
+    else detach_thread_input( thread->queue, parent->queue, win->desktop );
+}
+
 /* change the parent of a window (or unlink the window if the new parent is NULL) */
 static int set_parent_window( struct window *win, struct window *parent )
 {
@@ -413,8 +425,10 @@ static int set_parent_window( struct window *win, struct window *parent )
 
     if (parent)
     {
+        attach_parent_thread( win, false );
         if (win->parent) release_object( win->parent );
         win->parent = (struct window *)grab_object( parent );
+        attach_parent_thread( win, true );
         link_window( win, WINPTR_TOP );
 
         if (is_desktop_window( parent )) set_window_monitor_dpi( win );
@@ -424,11 +438,6 @@ static int set_parent_window( struct window *win, struct window *parent )
             shared->raw_dpi     = parent->shared->raw_dpi;
         }
         SHARED_WRITE_END;
-
-        /* if parent belongs to a different thread and the window isn't */
-        /* top-level, attach the two threads */
-        if (parent->thread && parent->thread != win->thread && !is_desktop_window(parent))
-            attach_thread_input( win->thread->queue, parent->thread->queue );
 
         if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))
             update_pixel_format_flags( win );
@@ -698,9 +707,8 @@ static struct window *create_window( struct window *parent, struct window *owner
     /* make sure that the thread has a message queue */
     if (!current->queue && !init_thread_queue( current )) goto failed;
 
-    /* if parent belongs to a different thread and the window isn't top-level, attach the two threads */
-    if (parent && parent->thread && parent->thread != current && !is_desktop_window( parent ))
-        attach_thread_input( current->queue, parent->thread->queue );
+    /* attach the parent thread if necessary */
+    attach_parent_thread( win, true );
 
     /* put it on parent unlinked list */
     if (parent) list_add_head( &parent->unlinked, &win->entry );
@@ -2157,7 +2165,7 @@ void free_window_handle( struct window *win )
         else
             send_notify_message( child->handle, WM_WINE_DESTROYWINDOW, 0, 0 );
     }
-    LIST_FOR_EACH_ENTRY_SAFE( child, next, &win->children, struct window, entry )
+    LIST_FOR_EACH_ENTRY_SAFE( child, next, &win->unlinked, struct window, entry )
     {
         if (!child->handle) continue;
         if (!win->thread || !child->thread || win->thread == child->thread)
@@ -2782,29 +2790,41 @@ DECL_HANDLER(get_window_rectangles)
 
     reply->window  = win->window_rect;
     reply->client  = win->client_rect;
+    reply->visible  = win->visible_rect;
 
     switch (req->relative)
     {
     case COORDS_CLIENT:
         offset_rect( &reply->window, -win->client_rect.left, -win->client_rect.top );
         offset_rect( &reply->client, -win->client_rect.left, -win->client_rect.top );
-        if (win->ex_style & WS_EX_LAYOUTRTL) mirror_rect( &win->client_rect, &reply->window );
+        offset_rect( &reply->visible, -win->client_rect.left, -win->client_rect.top );
+        if (win->ex_style & WS_EX_LAYOUTRTL)
+        {
+            mirror_rect( &win->client_rect, &reply->window );
+            mirror_rect( &win->client_rect, &reply->visible );
+        }
         break;
     case COORDS_WINDOW:
         offset_rect( &reply->window, -win->window_rect.left, -win->window_rect.top );
         offset_rect( &reply->client, -win->window_rect.left, -win->window_rect.top );
-        if (win->ex_style & WS_EX_LAYOUTRTL) mirror_rect( &win->window_rect, &reply->client );
+        if (win->ex_style & WS_EX_LAYOUTRTL)
+        {
+            mirror_rect( &win->window_rect, &reply->client );
+            mirror_rect( &win->window_rect, &reply->visible );
+        }
         break;
     case COORDS_PARENT:
         if (win->parent && win->parent->ex_style & WS_EX_LAYOUTRTL)
         {
             mirror_rect( &win->parent->client_rect, &reply->window );
             mirror_rect( &win->parent->client_rect, &reply->client );
+            mirror_rect( &win->parent->client_rect, &reply->visible );
         }
         break;
     case COORDS_SCREEN:
         client_to_screen_rect( win->parent, &reply->window );
         client_to_screen_rect( win->parent, &reply->client );
+        client_to_screen_rect( win->parent, &reply->visible );
         break;
     default:
         set_error( STATUS_INVALID_PARAMETER );
@@ -2812,6 +2832,7 @@ DECL_HANDLER(get_window_rectangles)
     }
     map_dpi_rect( win, &reply->window, get_window_dpi( win ), req->dpi );
     map_dpi_rect( win, &reply->client, get_window_dpi( win ), req->dpi );
+    map_dpi_rect( win, &reply->visible, get_window_dpi( win ), req->dpi );
 }
 
 

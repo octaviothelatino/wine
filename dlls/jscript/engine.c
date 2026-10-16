@@ -531,14 +531,14 @@ static HRESULT scope_gc_traverse(struct gc_ctx *gc_ctx, enum gc_traverse_op op, 
         unsigned i, cnt = vars->argc;
 
         for(i = 0; i < cnt; i++) {
-            hres = gc_process_linked_val(gc_ctx, op, dispex, &vars->var[i]);
+            hres = gc_process_linked_val(gc_ctx, op, &vars->var[i]);
             if(FAILED(hres))
                 return hres;
         }
     }
 
     if(scope->next) {
-        hres = gc_process_linked_obj(gc_ctx, op, dispex, &scope->next->dispex, (void**)&scope->next);
+        hres = gc_process_linked_obj(gc_ctx, op, &scope->next->dispex, (void**)&scope->next);
         if(FAILED(hres))
             return hres;
     }
@@ -552,7 +552,7 @@ static HRESULT scope_gc_traverse(struct gc_ctx *gc_ctx, enum gc_traverse_op op, 
         return S_OK;
     }
 
-    return scope->obj && (jsobj = to_jsdisp(scope->obj)) ? gc_process_linked_obj(gc_ctx, op, dispex, jsobj, (void**)&scope->obj) : S_OK;
+    return scope->obj && (jsobj = to_jsdisp(scope->obj)) ? gc_process_linked_obj(gc_ctx, op, jsobj, (void**)&scope->obj) : S_OK;
 }
 
 static const builtin_info_t scope_info = {
@@ -1029,7 +1029,16 @@ static HRESULT interp_forin(script_ctx_t *ctx)
     if(obj) {
         hres = IDispatch_QueryInterface(obj, &IID_IDispatchEx, (void**)&dispex);
         if(SUCCEEDED(hres)) {
-            hres = IDispatchEx_GetNextDispID(dispex, fdexEnumDefault, id, &id);
+            if (ctx->html_mode)
+            {
+                hres = IDispatchEx_GetNextDispID(dispex, make_grfdex(ctx, fdexEnumAll), id, &id);
+                if (FAILED(hres))
+                    hres = S_FALSE;
+            }
+            else
+            {
+                hres = IDispatchEx_GetNextDispID(dispex, make_grfdex(ctx, fdexEnumDefault), id, &id);
+            }
             if(hres == S_OK)
                 hres = IDispatchEx_GetMemberName(dispex, id, &name);
             IDispatchEx_Release(dispex);

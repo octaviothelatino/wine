@@ -939,6 +939,7 @@ enum wined3d_memory_segment_group
 /* Used internally. */
 #define WINED3D_BIND_DECODER_SRC                                0x80000000
 
+/* Flags identical to Direct3D 8/9. */
 #define WINED3DUSAGE_SOFTWAREPROCESSING                         0x00000010
 #define WINED3DUSAGE_DONOTCLIP                                  0x00000020
 #define WINED3DUSAGE_POINTS                                     0x00000040
@@ -952,6 +953,11 @@ enum wined3d_memory_segment_group
 #define WINED3DUSAGE_TEXTAPI                                    0x10000000
 #define WINED3DUSAGE_MASK                                       0x10007bf0
 
+/* wined3d-specific flags. */
+#define WINED3DUSAGE_SHARED                                     0x00000001
+#define WINED3DUSAGE_SHARED_NT_HANDLE                           0x00000002
+#define WINED3DUSAGE_SHARED_KEYED_MUTEX                         0x00000004
+#define WINED3DUSAGE_GENERATE_MIPMAPS                           0x00000008
 #define WINED3DUSAGE_SCRATCH                                    0x00400000
 #define WINED3DUSAGE_CS                                         0x00800000
 #define WINED3DUSAGE_LEGACY_CUBEMAP                             0x01000000
@@ -1586,7 +1592,6 @@ enum wined3d_memory_segment_group
 #define WINED3D_TEXTURE_CREATE_DISCARD                          0x00000002
 #define WINED3D_TEXTURE_CREATE_GET_DC_LENIENT                   0x00000004
 #define WINED3D_TEXTURE_CREATE_GET_DC                           0x00000008
-#define WINED3D_TEXTURE_CREATE_GENERATE_MIPMAPS                 0x00000010
 #define WINED3D_TEXTURE_CREATE_RECORD_DIRTY_REGIONS             0x00000020
 #define WINED3D_TEXTURE_CREATE_SHARED                           0x00000040
 
@@ -2387,6 +2392,8 @@ BOOL __cdecl wined3d_register_window(struct wined3d *wined3d, HWND window,
 HRESULT __cdecl wined3d_restore_display_modes(struct wined3d *wined3d);
 void __cdecl wined3d_unregister_windows(struct wined3d *wined3d);
 
+unsigned int __cdecl wined3d_adapter_get_decode_profile_count(struct wined3d_adapter *adapter);
+HRESULT __cdecl wined3d_adapter_get_decode_profile(struct wined3d_adapter *adapter, unsigned int idx, GUID *profile);
 HRESULT __cdecl wined3d_adapter_get_identifier(const struct wined3d_adapter *adapter,
         uint32_t flags, struct wined3d_adapter_identifier *identifier);
 struct wined3d_output * __cdecl wined3d_adapter_get_output(const struct wined3d_adapter *adapter,
@@ -2475,8 +2482,6 @@ struct wined3d_state * __cdecl wined3d_device_get_state(struct wined3d_device *d
 struct wined3d_swapchain * __cdecl wined3d_device_get_swapchain(const struct wined3d_device *device,
         UINT swapchain_idx);
 UINT __cdecl wined3d_device_get_swapchain_count(const struct wined3d_device *device);
-unsigned int __cdecl wined3d_device_get_video_decode_profile_count(struct wined3d_device *device);
-HRESULT __cdecl wined3d_device_get_video_decode_profile(struct wined3d_device *device, unsigned int idx, GUID *profile);
 struct wined3d * __cdecl wined3d_device_get_wined3d(const struct wined3d_device *device);
 ULONG __cdecl wined3d_device_incref(struct wined3d_device *device);
 HRESULT __cdecl wined3d_device_process_vertices(struct wined3d_device *device, struct wined3d_stateblock *stateblock,
@@ -2527,6 +2532,8 @@ HRESULT __cdecl wined3d_device_context_copy_sub_resource_region(struct wined3d_d
         unsigned int src_sub_resource_idx, const struct wined3d_box *src_box, unsigned int flags);
 void __cdecl wined3d_device_context_copy_uav_counter(struct wined3d_device_context *context,
         struct wined3d_buffer *dst_buffer, unsigned int offset, struct wined3d_unordered_access_view *uav);
+void __cdecl wined3d_device_context_discard_resource(struct wined3d_device_context *context,
+        struct wined3d_resource *resource, const struct wined3d_view_desc *desc);
 void __cdecl wined3d_device_context_dispatch(struct wined3d_device_context *context,
         unsigned int group_count_x, unsigned int group_count_y, unsigned int group_count_z);
 void __cdecl wined3d_device_context_dispatch_indirect(struct wined3d_device_context *context,
@@ -3077,7 +3084,7 @@ static inline int wined3d_bit_scan(unsigned int *x)
     for (bit_offset = 0; bit_offset < 32; bit_offset++)
         if (*x & (1u << bit_offset)) break;
 #endif
-    *x ^= 1u << bit_offset;
+    *x &= *x - 1;
     return bit_offset;
 }
 

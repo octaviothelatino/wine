@@ -44,6 +44,12 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(msxml);
 
+static bool bstr_equal(BSTR s1, BSTR s2)
+{
+    if (SysStringLen(s1) != SysStringLen(s2)) return false;
+    return !memcmp(s1, s2, SysStringLen(s1) * sizeof(WCHAR));
+}
+
 struct stream_wrapper
 {
     ISequentialStream ISequentialStream_iface;
@@ -360,21 +366,25 @@ static enum saxreader_feature get_saxreader_feature(const WCHAR *name)
 
 static const WCHAR empty_str;
 
-typedef struct
+struct ns
 {
     BSTR prefix;
     BSTR uri;
-} ns;
+};
 
-typedef struct
+struct element
 {
     struct list entry;
-    BSTR prefix;
-    BSTR local;
-    BSTR qname;
-    ns *ns; /* namespaces defined in this particular element */
-    int ns_count;
-} element_entry;
+    struct parsed_name name;
+    BSTR uri;
+
+    struct
+    {
+        struct ns *entries;
+        size_t count;
+        size_t capacity;
+    } ns;
+};
 
 enum saxhandler_type
 {
@@ -1102,6 +1112,154 @@ static void saxreader_free_element_decl(struct element_decl *decl)
     free(decl);
 }
 
+struct element_decl * parser_dtd_get_element_decl(struct dtd *dtd, BSTR name)
+{
+    struct element_decl *decl;
+
+    LIST_FOR_EACH_ENTRY(decl, &dtd->elements, struct element_decl, entry)
+    {
+        if (bstr_equal(decl->name, name))
+            return decl;
+    }
+
+    return NULL;
+}
+
+struct attlist_attr * parser_dtd_get_attr_decl(struct dtd *dtd, struct domnode *attr)
+{
+    struct domnode *elem = attr->parent;
+    struct attlist_decl *decl;
+
+    LIST_FOR_EACH_ENTRY(decl, &dtd->attr_decls, struct attlist_decl, entry)
+    {
+        if (bstr_equal(decl->name, elem->qname))
+        {
+            for (size_t i = 0; i < decl->count; ++i)
+            {
+                if (bstr_equal(decl->attributes[i].name.qname, attr->qname))
+                    return &decl->attributes[i];
+            }
+        }
+    }
+
+    return NULL;
+}
+
+bool parser_dtd_validate_attribute_value(struct validation_context *ctxt, struct dtd *dtd,
+        struct attlist_attr *decl, struct domnode *attr)
+{
+    bool ret = true;
+    HRESULT hr;
+    BSTR value;
+
+    if (FAILED(hr = node_get_text(attr, &value)))
+    {
+        ctxt->code = hr;
+        return false;
+    }
+
+    /* Instances must have same value for #FIXED defaults. */
+    if (decl->valuetype == ATTR_DEF_TYPE_FIXED && wcscmp(value, decl->value))
+    {
+        ctxt->code = E_DOM_ATTRIBUTE_FIXED;
+        ret = false;
+    }
+
+    if (ret && decl->type == ATTR_TYPE_ENUMERATION)
+    {
+        ret = false;
+        for (size_t i = 0; i < decl->valuelist.count; ++i)
+        {
+            if (!wcscmp(decl->valuelist.values[i], value))
+            {
+                ret = true;
+                break;
+            }
+        }
+
+        if (!ret)
+            ctxt->code = E_DOM_ATTRIBUTE_VALUE;
+    }
+
+    SysFreeString(value);
+
+    return ret;
+}
+
+static bool parser_dtd_validate_element_mixed_content(struct validation_context *ctxt, struct dtd *dtd,
+        struct element_decl *decl, struct domnode *elem)
+{
+    struct domnode *child = domnode_get_first_child(elem);
+    struct element_content *content;
+
+    while (child)
+    {
+        if (child->type == NODE_ELEMENT)
+        {
+            content = decl->content;
+            while (content)
+            {
+                if (content->type == ELEMENT_CONTENT_ELEMENT)
+                {
+                    if (bstr_equal(content->name, elem->qname)) break;
+                }
+                else if (content->type == ELEMENT_CONTENT_OR
+                        && content->left && content->left->type == ELEMENT_CONTENT_ELEMENT)
+                {
+                    if (bstr_equal(content->left->name, elem->qname)) break;
+                }
+
+                content = content->right;
+            }
+
+            if (!content)
+            {
+                ctxt->code = E_DOM_INVALID_CONTENT;
+                return false;
+            }
+        }
+
+        child = domnode_get_next_sibling(child);
+    }
+
+    return true;
+}
+
+bool parser_dtd_validate_element_content(struct validation_context *ctxt, struct dtd *dtd,
+        struct element_decl *decl, struct domnode *elem)
+{
+    struct domnode *child;
+
+    if (decl->type == ELEMENT_TYPE_EMPTY)
+    {
+        child = domnode_get_first_child(elem);
+        if (child)
+        {
+            switch (child->type)
+            {
+                case NODE_PROCESSING_INSTRUCTION:
+                case NODE_ENTITY_REFERENCE:
+                case NODE_CDATA_SECTION:
+                case NODE_COMMENT:
+                case NODE_TEXT:
+                    ctxt->code = E_DOM_ILLEGAL_TEXT;
+                    break;
+                default:
+                    ctxt->code = E_DOM_INVALID_CONTENT;
+                    break;
+            }
+
+            return false;
+        }
+    }
+    else if (decl->type == ELEMENT_TYPE_MIXED)
+    {
+        return parser_dtd_validate_element_mixed_content(ctxt, dtd, decl, elem);
+    }
+
+    return true;
+}
+
 struct dtd *parser_dtd_addref(struct dtd *dtd)
 {
     if (dtd)
@@ -1186,21 +1344,19 @@ static bool is_namespaces_enabled(const struct saxreader *reader)
     return (reader->version < MSXML4) || (reader->features & Namespaces);
 }
 
-static void free_element_entry(element_entry *element)
+static void saxreader_free_element(struct element *element)
 {
     int i;
 
-    for (i=0; i<element->ns_count;i++)
+    saxreader_free_name(&element->name);
+
+    for (i=0; i<element->ns.count; i++)
     {
-        SysFreeString(element->ns[i].prefix);
-        SysFreeString(element->ns[i].uri);
+        SysFreeString(element->ns.entries[i].prefix);
+        SysFreeString(element->ns.entries[i].uri);
     }
 
-    SysFreeString(element->prefix);
-    SysFreeString(element->local);
-    SysFreeString(element->qname);
-
-    free(element->ns);
+    free(element->ns.entries);
     free(element);
 }
 
@@ -1988,7 +2144,7 @@ static ULONG WINAPI isaxlocator_Release(ISAXLocator *iface)
 
     if (!refcount)
     {
-        element_entry *element, *element2;
+        struct element *element, *element2;
 
         saxreader_clear_attributes(locator);
         free(locator->attributes.entries);
@@ -1999,10 +2155,10 @@ static ULONG WINAPI isaxlocator_Release(ISAXLocator *iface)
         locator->dtd = NULL;
 
         /* element stack */
-        LIST_FOR_EACH_ENTRY_SAFE(element, element2, &locator->elements, element_entry, entry)
+        LIST_FOR_EACH_ENTRY_SAFE(element, element2, &locator->elements, struct element, entry)
         {
             list_remove(&element->entry);
-            free_element_entry(element);
+            saxreader_free_element(element);
         }
 
         encoded_buffer_cleanup(&locator->buffer.utf16);
@@ -2428,26 +2584,6 @@ static void saxreader_fatal_error(struct saxlocator *locator)
         }
     }
 }
-
-struct ns
-{
-    BSTR prefix;
-    BSTR uri;
-};
-
-struct element
-{
-    struct list entry;
-    struct parsed_name name;
-    BSTR uri;
-
-    struct
-    {
-        struct ns *entries;
-        size_t count;
-        size_t capacity;
-    } ns;
-};
 
 static HRESULT saxlocator_callback_result(struct saxlocator *locator, HRESULT hr)
 {
@@ -3762,18 +3898,6 @@ static struct element *saxreader_new_element(struct saxlocator *locator, struct 
     saxreader_clear_attributes(locator);
 
     return element;
-}
-
-static void saxreader_free_element(struct element *element)
-{
-    saxreader_free_name(&element->name);
-    free(element);
-}
-
-static bool bstr_equal(BSTR s1, BSTR s2)
-{
-    if (SysStringLen(s1) != SysStringLen(s2)) return false;
-    return !memcmp(s1, s2, SysStringLen(s1) * sizeof(WCHAR));
 }
 
 static bool bstr_startswith(BSTR s, const WCHAR *prefix, UINT length)

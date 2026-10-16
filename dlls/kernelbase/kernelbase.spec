@@ -606,7 +606,7 @@
 @ stdcall GetNLSVersionEx(long wstr ptr)
 @ stub GetNamedLocaleHashNode
 @ stub GetNamedPipeAttribute
-@ stub GetNamedPipeClientComputerNameW
+@ stdcall GetNamedPipeClientComputerNameW(long wstr long)
 @ stdcall GetNamedPipeHandleStateW(long ptr ptr ptr ptr ptr long)
 @ stdcall GetNamedPipeInfo(long ptr ptr ptr ptr)
 @ stdcall GetNativeSystemInfo(ptr)
@@ -1052,7 +1052,7 @@
 # @ stub PackageFamilyNameFromFullName
 # @ stub PackageFamilyNameFromId
 # @ stub PackageFamilyNameFromProductId
-# @ stub PackageFullNameFromId
+@ stdcall PackageFullNameFromId(ptr ptr ptr)
 # @ stub PackageFullNameFromProductId
 @ stdcall PackageIdFromFullName(wstr long ptr ptr)
 # @ stub PackageIdFromProductId
@@ -1282,8 +1282,8 @@
 @ stdcall ReOpenFile(ptr long long long)
 @ stdcall ReadConsoleA(long ptr long ptr ptr)
 @ stdcall ReadConsoleInputA(long ptr long ptr)
-@ stub ReadConsoleInputExA
-@ stub ReadConsoleInputExW
+@ stdcall ReadConsoleInputExA(long ptr long ptr long)
+@ stdcall ReadConsoleInputExW(long ptr long ptr long)
 @ stdcall ReadConsoleInputW(long ptr long ptr)
 @ stdcall ReadConsoleOutputA(long ptr long long ptr)
 @ stdcall ReadConsoleOutputAttribute(long ptr long long ptr)
@@ -1547,7 +1547,7 @@
 @ stdcall SetThreadpoolThreadMaximum(ptr long) ntdll.TpSetPoolMaxThreads
 @ stdcall SetThreadpoolThreadMinimum(ptr long) ntdll.TpSetPoolMinThreads
 @ stdcall SetThreadpoolTimer(ptr ptr long long) ntdll.TpSetTimer
-# @ stub SetThreadpoolTimerEx
+@ stdcall SetThreadpoolTimerEx(ptr ptr long long) ntdll.TpSetTimerEx
 @ stdcall SetThreadpoolWait(ptr long ptr) ntdll.TpSetWait
 # @ stub SetThreadpoolWaitEx
 @ stdcall SetTimeZoneInformation(ptr)

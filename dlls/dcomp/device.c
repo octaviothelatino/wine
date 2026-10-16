@@ -466,6 +466,7 @@ static DWORD WINAPI composite_thread_proc(void *iface)
     struct composition_target *target;
     struct composition_visual *visual;
     HDC hdc;
+    MSG msg;
 
     /* TODO: Implement and use D3DKMTWaitForVerticalBlankEvent() */
     hdc = GetDC(0);
@@ -475,6 +476,9 @@ static DWORD WINAPI composite_thread_proc(void *iface)
 
     while (TRUE)
     {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
+            DispatchMessageW(&msg);
+
         EnterCriticalSection(&device->cs);
 
         count = 0;
@@ -525,7 +529,7 @@ static DWORD WINAPI composite_thread_proc(void *iface)
         }
 
         LeaveCriticalSection(&device->cs);
-        Sleep(refresh_period);
+        MsgWaitForMultipleObjects(0, NULL, FALSE, refresh_period, QS_ALLINPUT);
     }
 
     return 0;

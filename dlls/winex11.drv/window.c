@@ -2483,8 +2483,8 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
     attr.backing_store = NotUseful;
     attr.border_pixel = 0;
 
-    x = data->rects.client.left - data->rects.visible.left;
-    y = data->rects.client.top - data->rects.visible.top;
+    x = client_rect.left;
+    y = client_rect.top;
     cx = min( max( 1, client_rect.right - client_rect.left ), 65535 );
     cy = min( max( 1, client_rect.bottom - client_rect.top ), 65535 );
 
@@ -2601,6 +2601,14 @@ done:
 }
 
 
+static int destroy_child_window_error( Display *display, XErrorEvent *event, void *arg )
+{
+    Window window = *(Window *)arg;
+
+    return event->error_code == BadWindow && event->request_code == X_DestroyWindow
+            && event->resourceid == window;
+}
+
 /**********************************************************************
  *		destroy_whole_window
  *
@@ -2622,7 +2630,16 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
         if (!already_destroyed)
         {
             XSync( gdi_display, False ); /* make sure XReparentWindow requests have completed before destroying whole_window */
+            /* A native parent may have already destroyed this child before its
+             * owning thread processes the asynchronous Win32 destruction. */
+            if (data->parent)
+                X11DRV_expect_error( data->display, destroy_child_window_error, &data->whole_window );
             XDestroyWindow( data->display, data->whole_window );
+            if (data->parent)
+            {
+                XSync( data->display, False );
+                X11DRV_check_error();
+            }
         }
     }
     if (data->whole_colormap) XFreeColormap( data->display, data->whole_colormap );
